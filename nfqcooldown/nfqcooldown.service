@@ -1,0 +1,14 @@
+[Unit]
+Description=NFQUEUE SYN cooldown
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/nfqcooldown
+ExecStart=/usr/local/sbin/nfqcooldown --queue ${QUEUE} --action ${ACTION} --mode ${MODE} --cooldown ${COOLDOWN} --min-delay ${MIN_DELAY} --max-delay ${MAX_DELAY} --jitter ${JITTER} --whitelist ${WHITELIST} --verbose=${VERBOSE}
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
