@@ -1,4 +1,5 @@
 # nfqcooldown
+[![Build](https://github.com/zperetz/nfqcooldown/actions/workflows/build.yml/badge.svg)](https://github.com/zperetz/nfqcooldown/actions/workflows/build.yml)
 
 **nfqcooldown** is an experimental NFQUEUE-based TCP SYN pacing daemon for Linux.
 
