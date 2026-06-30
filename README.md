@@ -111,7 +111,7 @@ Add an iptables NFQUEUE rule:
 
 ```bash
 sudo iptables -I INPUT 1 -i eth0 -p tcp --dport 443 \
-  --tcp-flags FIN,SYN,RST,ACK SYN \
+  -m tcp --tcp-flags SYN SYN \
   -j NFQUEUE --queue-num 443 --queue-bypass
 ```
 
