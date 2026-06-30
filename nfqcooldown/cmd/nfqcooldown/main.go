@@ -29,6 +29,7 @@ type Config struct {
 	Seed         int64
 	StatsEvery   time.Duration
 	CleanupAfter time.Duration
+	CleanupEvery time.Duration
 }
 
 func parseConfig() Config {
@@ -44,6 +45,7 @@ func parseConfig() Config {
 	seed := flag.Int64("seed", 0, "random seed; 0 means current time")
 	statsEveryStr := flag.String("stats-every", "30s", "aggregate stats interval")
 	cleanupAfterStr := flag.String("cleanup-after", "10m", "forget inactive IPs after this duration")
+	cleanupEveryStr := flag.String("cleanup-every", "30s", "cleanup interval")
 	flag.Parse()
 
 	cooldown := mustDuration("cooldown", *cooldownStr)
@@ -52,6 +54,7 @@ func parseConfig() Config {
 	jitter := mustDuration("jitter", *jitterStr)
 	statsEvery := mustDuration("stats-every", *statsEveryStr)
 	cleanupAfter := mustDuration("cleanup-after", *cleanupAfterStr)
+	cleanupEvery := mustDuration("cleanup-every", *cleanupEveryStr)
 
 	if *action != "drop" && *action != "delay" && *action != "reject" {
 		fatalf("bad action %q: use drop, delay or reject", *action)
@@ -89,7 +92,7 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	go cleanupLoop(ctx, state, cfg.CleanupAfter)
+	go cleanupLoop(ctx, state, cfg.CleanupEvery, cfg.CleanupAfter)
 	go statsLoop(ctx, cfg, state, counters)
 
 	handler := func(a nfqueue.Attribute) int {
@@ -148,9 +151,21 @@ func main() {
 	<-ctx.Done()
 }
 
-func cleanupLoop(ctx context.Context, state *core.State, ttl time.Duration) {
-	t := time.NewTicker(60 * time.Second); defer t.Stop()
-	for { select { case <-ctx.Done(): return; case <-t.C: state.Cleanup(ttl) } }
+func cleanupLoop(ctx context.Context, state *core.State, every, ttl time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			removed := state.Cleanup(ttl)
+			if removed > 0 {
+				fmt.Printf("[nfqcooldown] cleanup removed=%d ttl=%s\n", removed, ttl)
+			}
+		}
+	}
 }
 
 func statsLoop(ctx context.Context, cfg Config, state *core.State, counters *core.Counters) {
