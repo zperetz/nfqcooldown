@@ -45,7 +45,7 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 info "detected platform: ${GOOS}/${GOARCH}"
 info "downloading latest release: ${ASSET}"
 
-curl -qfL "$DOWNLOAD_URL" -o "${TMP_DIR}/${ASSET}" \
+curl -fsSL "$DOWNLOAD_URL" -o "${TMP_DIR}/${ASSET}" \
   || fail "failed to download ${DOWNLOAD_URL}"
 
 info "extracting"
