@@ -38,7 +38,7 @@ This makes it possible to implement packet handling logic that is difficult or i
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/zperetz/nfqcooldown/main/install.sh | sudo bash
-```bash
+```
 
 
 ## How it works
