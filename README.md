@@ -40,7 +40,6 @@ This makes it possible to implement packet handling logic that is difficult or i
 curl -fsSL https://raw.githubusercontent.com/zperetz/nfqcooldown/main/install.sh | sudo bash
 ```
 
-
 ## How it works
 
 A typical setup looks like this:
