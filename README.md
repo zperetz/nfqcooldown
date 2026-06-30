@@ -163,7 +163,7 @@ sudo nfqcooldown \
   --action drop \
   --mode fixed \
   --cooldown 500ms \
-  --whitelist 93.158.192.22,185.93.42.204/32
+  --whitelist 90.80.70.60,185.186.187.188/32
 ```
 
 ### Verbose logging
