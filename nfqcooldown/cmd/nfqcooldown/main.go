@@ -60,7 +60,7 @@ func parseConfig() Config {
 		fatalf("bad action %q: use drop, delay or reject", *action)
 	}
 
-	return Config{QueueNum: *queueNum, Action: *action, Mode: *mode, Cooldown: cooldown, MinDelay: minDelay, MaxDelay: maxDelay, Jitter: jitter, Whitelist: *whitelist, Verbose: *verbose, Seed: *seed, StatsEvery: statsEvery, CleanupAfter: cleanupAfter}
+	return Config{QueueNum: *queueNum, Action: *action, Mode: *mode, Cooldown: cooldown, MinDelay: minDelay, MaxDelay: maxDelay, Jitter: jitter, Whitelist: *whitelist, Verbose: *verbose, Seed: *seed, StatsEvery: statsEvery, CleanupAfter: cleanupAfter, CleanupEvery: cleanupEvery}
 }
 
 func mustDuration(name, value string) time.Duration {
