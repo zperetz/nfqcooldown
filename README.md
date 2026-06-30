@@ -68,6 +68,13 @@ iptables -I INPUT 1 -i eth0 -p tcp --dport 443 \
 
 The `--queue-bypass` option is recommended. If the daemon is stopped or crashes, packets continue through the normal firewall path instead of being blocked.
 
+Make sure your normal ACCEPT rule remains below it:
+
+```bash
+sudo iptables -A INPUT -i eth0 -p tcp --dport 443 -j ACCEPT
+```
+
+
 ## Installation
 
 Build the binary:
@@ -251,22 +258,6 @@ View logs:
 journalctl -u nfqcooldown -f
 ```
 
-## iptables example
-
-A minimal setup for TCP port 443:
-
-```bash
-sudo iptables -I INPUT 1 -i eth0 -p tcp --dport 443 \
-  --tcp-flags FIN,SYN,RST,ACK SYN \
-  -j NFQUEUE --queue-num 443 --queue-bypass
-```
-
-Make sure your normal ACCEPT rule remains below it:
-
-```bash
-sudo iptables -A INPUT -i eth0 -p tcp --dport 443 -j ACCEPT
-```
-
 ## Logging
 
 Normal mode prints aggregate statistics:
@@ -287,29 +278,7 @@ Verbose mode prints every packet decision:
 
 * IPv4 TCP SYN parsing only
 * `reject` mode is currently logged separately but uses a DROP verdict internally
-* Real TCP RST generation is not implemented yet
 * Per-source-IP tracking only
-* No JSON logs yet
-* No Prometheus metrics yet
-
-## Roadmap
-
-* [x] Fixed cooldown algorithm
-* [x] Random cooldown algorithm
-* [x] Jitter cooldown algorithm
-* [x] Drop action
-* [x] Delay action
-* [x] IP/CIDR whitelist
-* [x] Verbose logging
-* [ ] True TCP RST reject mode
-* [ ] JSON logging
-* [ ] CSV export
-* [ ] Prometheus metrics
-* [ ] Global cooldown scope
-* [ ] Subnet-based cooldown scope
-* [ ] Random-walk algorithm
-* [ ] nftables examples
-* [ ] GitHub Actions build workflow
 
 ## License
 
