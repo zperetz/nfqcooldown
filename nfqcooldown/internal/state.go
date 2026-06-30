@@ -74,13 +74,21 @@ func (s *State) RememberEvent(ev LastEvent) {
 	s.lastEvent = ev
 }
 
-func (s *State) Cleanup(ttl time.Duration) {
+func (s *State) Cleanup(ttl time.Duration) int {
 	cutoff := time.Now().Add(-ttl)
+	removed := 0
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	for ip, st := range s.clients {
-		if st.LastSeen.Before(cutoff) { delete(s.clients, ip) }
+		if st.LastSeen.Before(cutoff) {
+			delete(s.clients, ip)
+			removed++
+		}
 	}
+
+	return removed
 }
 
 func (s *State) Snapshot() (tracked int, ev LastEvent) {
