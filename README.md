@@ -208,8 +208,8 @@ Verbose mode logs individual packet decisions.
 | `--verbose`       | Enable per-packet decision logging                   |
 | `--seed`          | Random seed for reproducible experiments             |
 | `--stats-every`   | Aggregate statistics interval                        |
-| `--cleanup-every` | Remove inactive IPs from memory every <duration>     |
-| `--cleanup-after` | Remove inactive IPs from memory after <duration>     |
+| `--cleanup-every` | Remove inactive IPs from memory every `duration`     |
+| `--cleanup-after` | Remove inactive IPs from memory after `duration`     |
 
 ## systemd service
 
