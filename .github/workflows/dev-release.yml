@@ -34,6 +34,9 @@ jobs:
         with:
           go-version: "1.25"
 
+      - name: Download dependencies
+        run: go mod download
+
       - name: Build
         run: |
           mkdir -p dist
@@ -44,6 +47,13 @@ jobs:
         run: |
           cd dist
           tar -czf ${{ matrix.name }}.tar.gz ${{ matrix.name }}
+
+      - name: Delete old dev release
+        continue-on-error: true
+        run: |
+          gh release delete dev-latest --yes --cleanup-tag
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Upload dev release asset
         uses: softprops/action-gh-release@v2
