@@ -100,6 +100,5 @@ func (s *State) Snapshot() (tracked int, ev LastEvent) {
 func (s *State) Forget(ip string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	delete(s.clients, ip)
 }
