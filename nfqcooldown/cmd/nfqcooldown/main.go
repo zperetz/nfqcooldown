@@ -30,6 +30,7 @@ type Config struct {
 	StatsEvery   time.Duration
 	CleanupAfter time.Duration
 	CleanupEvery time.Duration
+	ForgetOnDrop bool
 }
 
 func parseConfig() Config {
@@ -56,11 +57,13 @@ func parseConfig() Config {
 	cleanupAfter := mustDuration("cleanup-after", *cleanupAfterStr)
 	cleanupEvery := mustDuration("cleanup-every", *cleanupEveryStr)
 
+	forgetOnDrop := flag.Bool("forget-on-drop", false, "forget source IP state after DROP/REJECT")
+	
 	if *action != "drop" && *action != "delay" && *action != "reject" {
 		fatalf("bad action %q: use drop, delay or reject", *action)
 	}
 
-	return Config{QueueNum: *queueNum, Action: *action, Mode: *mode, Cooldown: cooldown, MinDelay: minDelay, MaxDelay: maxDelay, Jitter: jitter, Whitelist: *whitelist, Verbose: *verbose, Seed: *seed, StatsEvery: statsEvery, CleanupAfter: cleanupAfter, CleanupEvery: cleanupEvery}
+	return Config{QueueNum: *queueNum, Action: *action, Mode: *mode, Cooldown: cooldown, MinDelay: minDelay, MaxDelay: maxDelay, Jitter: jitter, Whitelist: *whitelist, Verbose: *verbose, Seed: *seed, StatsEvery: statsEvery, ForgetOnDrop: *forgetOnDrop, CleanupAfter: cleanupAfter, CleanupEvery: cleanupEvery}
 }
 
 func mustDuration(name, value string) time.Duration {
@@ -122,11 +125,17 @@ func main() {
 		case "drop":
 			counters.IncDropped()
 			state.RememberEvent(core.LastEvent{Type: "DROP", IP: srcIP, PacketID: id, Cooldown: cooldown, Elapsed: elapsed, Remaining: remaining})
+			if cfg.ForgetOnDrop {
+				state.Forget(srcIP)
+			}
 			logVerbose(cfg.Verbose, "DROP ip=%s packet=%d cooldown=%s elapsed=%s remaining=%s", srcIP, id, cooldown, elapsed, remaining)
 			_ = nf.SetVerdict(id, nfqueue.NfDrop); return 0
 		case "reject":
 			counters.IncRejected()
 			state.RememberEvent(core.LastEvent{Type: "REJECT-DROP", IP: srcIP, PacketID: id, Cooldown: cooldown, Elapsed: elapsed, Remaining: remaining})
+			if cfg.ForgetOnDrop {
+				state.Forget(srcIP)
+			}
 			logVerbose(cfg.Verbose, "REJECT(DROP) ip=%s packet=%d cooldown=%s elapsed=%s remaining=%s", srcIP, id, cooldown, elapsed, remaining)
 			_ = nf.SetVerdict(id, nfqueue.NfDrop); return 0
 		case "delay":
