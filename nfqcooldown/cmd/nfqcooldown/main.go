@@ -47,6 +47,7 @@ func parseConfig() Config {
 	statsEveryStr := flag.String("stats-every", "30s", "aggregate stats interval")
 	cleanupAfterStr := flag.String("cleanup-after", "10m", "forget inactive IPs after this duration")
 	cleanupEveryStr := flag.String("cleanup-every", "30s", "cleanup interval")
+	forgetOnDrop := flag.Bool("forget-on-drop", false, "forget source IP state after DROP/REJECT")
 	flag.Parse()
 
 	cooldown := mustDuration("cooldown", *cooldownStr)
@@ -57,8 +58,6 @@ func parseConfig() Config {
 	cleanupAfter := mustDuration("cleanup-after", *cleanupAfterStr)
 	cleanupEvery := mustDuration("cleanup-every", *cleanupEveryStr)
 
-	forgetOnDrop := flag.Bool("forget-on-drop", false, "forget source IP state after DROP/REJECT")
-	
 	if *action != "drop" && *action != "delay" && *action != "reject" {
 		fatalf("bad action %q: use drop, delay or reject", *action)
 	}
