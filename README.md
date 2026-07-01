@@ -208,7 +208,8 @@ Verbose mode logs individual packet decisions.
 | `--verbose`       | Enable per-packet decision logging                   |
 | `--seed`          | Random seed for reproducible experiments             |
 | `--stats-every`   | Aggregate statistics interval                        |
-| `--cleanup-after` | Remove inactive IPs from memory after this duration  |
+| `--cleanup-every` | Remove inactive IPs from memory every <duration>     |
+| `--cleanup-after` | Remove inactive IPs from memory after <duration>     |
 
 ## systemd service
 
@@ -223,7 +224,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/default/nfqcooldown
-ExecStart=/usr/local/sbin/nfqcooldown --queue ${QUEUE} --action ${ACTION} --mode ${MODE} --cooldown ${COOLDOWN} --min-delay ${MIN_DELAY} --max-delay ${MAX_DELAY} --jitter ${JITTER} --whitelist ${WHITELIST} --verbose=${VERBOSE}
+ExecStart=/usr/local/sbin/nfqcooldown --queue ${QUEUE} --action ${ACTION} --mode ${MODE} --cooldown ${COOLDOWN} --min-delay ${MIN_DELAY} --max-delay ${MAX_DELAY} --jitter ${JITTER} --whitelist ${WHITELIST} --verbose=${VERBOSE}  --cleanup-every=${CLEANUP_EVERY} --cleanup-after=${CLEANUP_AFTER}
 Restart=always
 RestartSec=2
 
@@ -243,6 +244,8 @@ MAX_DELAY=450ms
 JITTER=100ms
 WHITELIST=
 VERBOSE=false
+CLEANUP_EVERY=15s
+CLEANUP_AFTER=30s
 ```
 
 Enable service:
