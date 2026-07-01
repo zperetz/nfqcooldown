@@ -210,6 +210,7 @@ Verbose mode logs individual packet decisions.
 | `--stats-every`   | Aggregate statistics interval                        |
 | `--cleanup-every` | Remove inactive IPs from memory every `duration`     |
 | `--cleanup-after` | Remove inactive IPs from memory after `duration`     |
+| `--forget-on-drop`| Remove IP in case of DROP action                     |
 
 ## systemd service
 
