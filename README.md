@@ -195,22 +195,23 @@ Verbose mode logs individual packet decisions.
 
 ## Command-line options
 
-| Option            | Description                                          |
-| ----------------- | ---------------------------------------------------- |
-| `--queue`         | NFQUEUE number                                       |
-| `--action`        | Action inside cooldown: `drop`, `delay`, or `reject` |
-| `--mode`          | Cooldown algorithm: `fixed`, `random`, or `jitter`   |
-| `--cooldown`      | Base cooldown duration                               |
-| `--min-delay`     | Minimum delay for random mode                        |
-| `--max-delay`     | Maximum delay for random mode                        |
-| `--jitter`        | Jitter range around base cooldown                    |
-| `--whitelist`     | Comma-separated list of trusted IPs or CIDRs         |
-| `--verbose`       | Enable per-packet decision logging                   |
-| `--seed`          | Random seed for reproducible experiments             |
-| `--stats-every`   | Aggregate statistics interval                        |
-| `--cleanup-every` | Remove inactive IPs from memory every `duration`     |
-| `--cleanup-after` | Remove inactive IPs from memory after `duration`     |
-| `--forget-on-drop`| Remove IP in case of DROP action                     |
+| Option               | Description                                            |
+| -------------------- | ------------------------------------------------------ |
+| `--queue`            | NFQUEUE number                                         |
+| `--action`           | Action inside cooldown: `drop`, `delay`, or `reject`   |
+| `--mode`             | Cooldown algorithm: `fixed`, `random`, or `jitter`     |
+| `--cooldown`         | Base cooldown duration                                 |
+| `--min-delay`        | Minimum delay for random mode                          |
+| `--max-delay`        | Maximum delay for random mode                          |
+| `--jitter`           | Jitter range around base cooldown                      |
+| `--whitelist`        | Comma-separated list of trusted IPs or CIDRs           |
+| `--verbose`          | Enable per-packet decision logging                     |
+| `--seed`             | Random seed for reproducible experiments               |
+| `--stats-every`      | Aggregate statistics interval                          |
+| `--cleanup-every`    | Remove inactive IPs from memory every `duration`       |
+| `--cleanup-after`    | Remove inactive IPs from memory after `duration`       |
+| `--forget-on-drop`   | Remove IP in case of DROP action                       |
+| `--max-drops-per-ip` | force accept after N consecutive drops from same IP    |
 
 ## systemd service
 
@@ -225,7 +226,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/default/nfqcooldown
-ExecStart=/usr/local/sbin/nfqcooldown --queue ${QUEUE} --action ${ACTION} --mode ${MODE} --cooldown ${COOLDOWN} --min-delay ${MIN_DELAY} --max-delay ${MAX_DELAY} --jitter ${JITTER} --whitelist ${WHITELIST} --verbose=${VERBOSE}  --cleanup-every=${CLEANUP_EVERY} --cleanup-after=${CLEANUP_AFTER}
+ExecStart=/usr/local/sbin/nfqcooldown --queue ${QUEUE} --action ${ACTION} --mode ${MODE} --cooldown ${COOLDOWN} --min-delay ${MIN_DELAY} --max-delay ${MAX_DELAY} --jitter ${JITTER} --whitelist ${WHITELIST} --verbose=${VERBOSE}  --cleanup-every=${CLEANUP_EVERY} --cleanup-after=${CLEANUP_AFTER} --max-drops-per-ip ${MAX_DROPS}
 Restart=always
 RestartSec=2
 
@@ -240,13 +241,14 @@ QUEUE=443
 ACTION=drop
 MODE=fixed
 COOLDOWN=500ms
-MIN_DELAY=300ms
-MAX_DELAY=450ms
+MIN_DELAY=550ms
+MAX_DELAY=900ms
 JITTER=100ms
 WHITELIST=
 VERBOSE=false
 CLEANUP_EVERY=15s
-CLEANUP_AFTER=30s
+CLEANUP_AFTER=2m
+MAX_DROPS=10
 ```
 
 Enable service:
