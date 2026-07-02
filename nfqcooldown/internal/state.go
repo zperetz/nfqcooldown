@@ -8,6 +8,7 @@ import (
 type ClientState struct {
 	LastSeen time.Time
 	Cooldown time.Duration
+	DropCount int
 }
 
 type LastEvent struct {
@@ -46,7 +47,7 @@ func (s *State) Decide(ip string, now time.Time, packetID uint32) (allowed bool,
 	elapsed = now.Sub(st.LastSeen)
 	if elapsed >= st.Cooldown {
 		cd := s.algorithm.Next()
-		s.clients[ip] = ClientState{LastSeen: now, Cooldown: cd}
+		s.clients[ip] = ClientState{LastSeen: now, Cooldown: cd, DropCount: 0}
 		ev := LastEvent{Type: "ACCEPT", IP: ip, PacketID: packetID, Cooldown: cd, Elapsed: elapsed}
 		s.lastEvent = ev
 		return true, cd, elapsed, 0, ev
@@ -95,4 +96,46 @@ func (s *State) Snapshot() (tracked int, ev LastEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.clients), s.lastEvent
+}
+
+func (s *State) Forget(ip string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.clients, ip)
+}
+
+func (s *State) IncDrop(ip string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	st, ok := s.clients[ip]
+	if !ok {
+		return 0
+	}
+
+	st.DropCount++
+	s.clients[ip] = st
+	return st.DropCount
+}
+
+func (s *State) ForceAccept(ip string, now time.Time, packetID uint32) (time.Duration, LastEvent) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cd := s.algorithm.Next()
+	s.clients[ip] = ClientState{
+		LastSeen:  now,
+		Cooldown:  cd,
+		DropCount: 0,
+	}
+
+	ev := LastEvent{
+		Type:     "FORCE-ACCEPT",
+		IP:       ip,
+		PacketID: packetID,
+		Cooldown: cd,
+	}
+
+	s.lastEvent = ev
+	return cd, ev
 }

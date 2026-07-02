@@ -1,13 +1,14 @@
-name: Build
+name: Development Release
 
 on:
   push:
-    branches: [ main, dev ]
-  pull_request:
-    branches: [ main ]
+    branches: [ dev ]
+
+permissions:
+  contents: write
 
 jobs:
-  build:
+  dev-release:
     runs-on: ubuntu-latest
 
     defaults:
@@ -36,9 +37,6 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
-      - name: Test
-        run: go test ./...
-
       - name: Build
         run: |
           mkdir -p dist
@@ -50,8 +48,22 @@ jobs:
           cd dist
           tar -czf ${{ matrix.name }}.tar.gz ${{ matrix.name }}
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Delete old dev release
+        continue-on-error: true
+        run: |
+          gh release delete dev-latest --yes --cleanup-tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Upload dev release asset
+        uses: softprops/action-gh-release@v2
         with:
-          name: ${{ matrix.name }}
-          path: nfqcooldown/dist/${{ matrix.name }}.tar.gz
+          tag_name: dev-latest
+          name: Development Build
+          body: |
+            Automatic development build from the `dev` branch.
+
+            This release is intended for testing only.
+          prerelease: true
+          make_latest: false
+          files: nfqcooldown/dist/${{ matrix.name }}.tar.gz

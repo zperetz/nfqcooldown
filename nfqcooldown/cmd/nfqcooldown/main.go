@@ -30,6 +30,8 @@ type Config struct {
 	StatsEvery   time.Duration
 	CleanupAfter time.Duration
 	CleanupEvery time.Duration
+	ForgetOnDrop bool
+	MaxDropsPerIP int
 }
 
 func parseConfig() Config {
@@ -46,6 +48,8 @@ func parseConfig() Config {
 	statsEveryStr := flag.String("stats-every", "30s", "aggregate stats interval")
 	cleanupAfterStr := flag.String("cleanup-after", "10m", "forget inactive IPs after this duration")
 	cleanupEveryStr := flag.String("cleanup-every", "30s", "cleanup interval")
+	forgetOnDrop := flag.Bool("forget-on-drop", false, "forget source IP state after DROP/REJECT")
+	maxDropsPerIP := flag.Int("max-drops-per-ip", 0, "force accept after N consecutive drops from same IP; 0 disables")
 	flag.Parse()
 
 	cooldown := mustDuration("cooldown", *cooldownStr)
@@ -60,7 +64,7 @@ func parseConfig() Config {
 		fatalf("bad action %q: use drop, delay or reject", *action)
 	}
 
-	return Config{QueueNum: *queueNum, Action: *action, Mode: *mode, Cooldown: cooldown, MinDelay: minDelay, MaxDelay: maxDelay, Jitter: jitter, Whitelist: *whitelist, Verbose: *verbose, Seed: *seed, StatsEvery: statsEvery, CleanupAfter: cleanupAfter, CleanupEvery: cleanupEvery}
+	return Config{QueueNum: *queueNum, Action: *action, Mode: *mode, Cooldown: cooldown, MinDelay: minDelay, MaxDelay: maxDelay, Jitter: jitter, Whitelist: *whitelist, Verbose: *verbose, Seed: *seed, StatsEvery: statsEvery, MaxDropsPerIP: *maxDropsPerIP, ForgetOnDrop: *forgetOnDrop, CleanupAfter: cleanupAfter, CleanupEvery: cleanupEvery}
 }
 
 func mustDuration(name, value string) time.Duration {
@@ -120,13 +124,47 @@ func main() {
 
 		switch cfg.Action {
 		case "drop":
+			dropCount := state.IncDrop(srcIP)
+
+			if cfg.MaxDropsPerIP > 0 && dropCount > cfg.MaxDropsPerIP {
+			    cd, _ := state.ForceAccept(srcIP, time.Now(), id)
+			    counters.IncAccepted()
+
+			    logVerbose(cfg.Verbose,
+				"FORCE-ACCEPT ip=%s packet=%d drops=%d new_cooldown=%s",
+				srcIP, id, dropCount, cd,
+			    )
+
+			    _ = nf.SetVerdict(id, nfqueue.NfAccept)
+			    return 0
+			}
 			counters.IncDropped()
 			state.RememberEvent(core.LastEvent{Type: "DROP", IP: srcIP, PacketID: id, Cooldown: cooldown, Elapsed: elapsed, Remaining: remaining})
+			if cfg.ForgetOnDrop {
+				state.Forget(srcIP)
+			}
 			logVerbose(cfg.Verbose, "DROP ip=%s packet=%d cooldown=%s elapsed=%s remaining=%s", srcIP, id, cooldown, elapsed, remaining)
 			_ = nf.SetVerdict(id, nfqueue.NfDrop); return 0
 		case "reject":
+			dropCount := state.IncDrop(srcIP)
+
+			if cfg.MaxDropsPerIP > 0 && dropCount > cfg.MaxDropsPerIP {
+			    cd, _ := state.ForceAccept(srcIP, time.Now(), id)
+			    counters.IncAccepted()
+
+			    logVerbose(cfg.Verbose,
+				"FORCE-ACCEPT ip=%s packet=%d drops=%d new_cooldown=%s",
+				srcIP, id, dropCount, cd,
+			    )
+
+			    _ = nf.SetVerdict(id, nfqueue.NfAccept)
+			    return 0
+			}
 			counters.IncRejected()
 			state.RememberEvent(core.LastEvent{Type: "REJECT-DROP", IP: srcIP, PacketID: id, Cooldown: cooldown, Elapsed: elapsed, Remaining: remaining})
+			if cfg.ForgetOnDrop {
+				state.Forget(srcIP)
+			}
 			logVerbose(cfg.Verbose, "REJECT(DROP) ip=%s packet=%d cooldown=%s elapsed=%s remaining=%s", srcIP, id, cooldown, elapsed, remaining)
 			_ = nf.SetVerdict(id, nfqueue.NfDrop); return 0
 		case "delay":
