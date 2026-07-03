@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+	"strconv"
 
 	core "nfqcooldown/internal"
 
@@ -32,7 +33,10 @@ type Config struct {
 	CleanupEvery time.Duration
 	ForgetOnDrop bool
 	MaxDropsPerIP int
+	RejectMark   int
 }
+
+
 
 func parseConfig() Config {
 	queueNum := flag.Uint("queue", 443, "NFQUEUE number")
@@ -50,6 +54,7 @@ func parseConfig() Config {
 	cleanupEveryStr := flag.String("cleanup-every", "30s", "cleanup interval")
 	forgetOnDrop := flag.Bool("forget-on-drop", false, "forget source IP state after DROP/REJECT")
 	maxDropsPerIP := flag.Int("max-drops-per-ip", 0, "force accept after N consecutive drops from same IP; 0 disables")
+	rejectMarkStr := flag.String("reject-mark", "0", "packet mark for reject action, e.g. 0x44; 0 disables")
 	flag.Parse()
 
 	cooldown := mustDuration("cooldown", *cooldownStr)
@@ -59,12 +64,15 @@ func parseConfig() Config {
 	statsEvery := mustDuration("stats-every", *statsEveryStr)
 	cleanupAfter := mustDuration("cleanup-after", *cleanupAfterStr)
 	cleanupEvery := mustDuration("cleanup-every", *cleanupEveryStr)
-
+	rejectMark64, err := strconv.ParseUint(*rejectMarkStr, 0, 32)
+	if err != nil {
+		fatalf("bad reject-mark %q: %v", *rejectMarkStr, err)
+	}
 	if *action != "drop" && *action != "delay" && *action != "reject" {
 		fatalf("bad action %q: use drop, delay or reject", *action)
 	}
 
-	return Config{QueueNum: *queueNum, Action: *action, Mode: *mode, Cooldown: cooldown, MinDelay: minDelay, MaxDelay: maxDelay, Jitter: jitter, Whitelist: *whitelist, Verbose: *verbose, Seed: *seed, StatsEvery: statsEvery, MaxDropsPerIP: *maxDropsPerIP, ForgetOnDrop: *forgetOnDrop, CleanupAfter: cleanupAfter, CleanupEvery: cleanupEvery}
+	return Config{QueueNum: *queueNum, Action: *action, Mode: *mode, Cooldown: cooldown, MinDelay: minDelay, MaxDelay: maxDelay, Jitter: jitter, Whitelist: *whitelist, Verbose: *verbose, Seed: *seed, StatsEvery: statsEvery, RejectMark: int(rejectMark64), MaxDropsPerIP: *maxDropsPerIP, ForgetOnDrop: *forgetOnDrop, CleanupAfter: cleanupAfter, CleanupEvery: cleanupEvery}
 }
 
 func mustDuration(name, value string) time.Duration {
@@ -166,7 +174,12 @@ func main() {
 				state.Forget(srcIP)
 			}
 			logVerbose(cfg.Verbose, "REJECT(DROP) ip=%s packet=%d cooldown=%s elapsed=%s remaining=%s", srcIP, id, cooldown, elapsed, remaining)
-			_ = nf.SetVerdict(id, nfqueue.NfDrop); return 0
+			if cfg.RejectMark != 0 {
+				_ = nf.SetVerdictWithMark(id, nfqueue.NfAccept, cfg.RejectMark)
+			} else {
+				_ = nf.SetVerdict(id, nfqueue.NfDrop)
+			}
+			return 0
 		case "delay":
 			counters.IncDelayed()
 			state.RememberEvent(core.LastEvent{Type: "DELAY", IP: srcIP, PacketID: id, Cooldown: cooldown, Elapsed: elapsed, Remaining: remaining})
