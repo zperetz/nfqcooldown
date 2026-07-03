@@ -30,9 +30,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
           go-version: "1.25"
+          cache-dependency-path: nfqcooldown/go.sum
 
       - name: Download dependencies
         run: go mod download
@@ -51,9 +52,16 @@ jobs:
       - name: Delete old dev release
         continue-on-error: true
         run: |
-          gh release delete dev-latest --yes --cleanup-tag
+          gh release delete dev-latest --yes
         env:
           GH_TOKEN: ${{ github.token }}
+
+      - name: Create or update dev-latest tag
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git tag -f dev-latest
+          git push -f origin dev-latest
 
       - name: Upload dev release asset
         uses: softprops/action-gh-release@v2
