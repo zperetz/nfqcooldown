@@ -11,10 +11,6 @@ jobs:
   dev-release:
     runs-on: ubuntu-latest
 
-    defaults:
-      run:
-        working-directory: ./nfqcooldown
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
