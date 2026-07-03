@@ -66,5 +66,5 @@ jobs:
           prerelease: true
           make_latest: false
           files: |
-            nfqcooldown/dist/nfqcooldown-linux-amd64.tar.gz
-            nfqcooldown/dist/nfqcooldown-linux-arm64.tar.gz
+            dist/nfqcooldown-linux-amd64.tar.gz
+            dist/nfqcooldown-linux-arm64.tar.gz

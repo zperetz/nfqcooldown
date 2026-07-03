@@ -50,4 +50,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: nfqcooldown/dist/${{ matrix.name }}.tar.gz
+          path: dist/${{ matrix.name }}.tar.gz
