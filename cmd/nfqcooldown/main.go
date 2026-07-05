@@ -16,6 +16,8 @@ import (
 	"github.com/mdlayher/netlink"
 )
 
+var Version = "dev"
+
 type Config struct {
 	QueueNum     uint
 	Action       string
@@ -50,6 +52,20 @@ func parseConfig() Config {
 	cleanupEveryStr := flag.String("cleanup-every", "30s", "cleanup interval")
 	forgetOnDrop := flag.Bool("forget-on-drop", false, "forget source IP state after DROP/REJECT")
 	maxDropsPerIP := flag.Int("max-drops-per-ip", 0, "force accept after N consecutive drops from same IP; 0 disables")
+
+	flag.Usage = printUsage
+
+	for _, arg := range os.Args[1:] {
+	    switch arg {
+	    case "--help":
+		printUsage()
+		os.Exit(0)
+	    case "--version":
+		fmt.Printf("nfqcooldown %s\n", Version)
+		os.Exit(0)
+	    }
+	}
+
 	flag.Parse()
 
 	cooldown := mustDuration("cooldown", *cooldownStr)
@@ -74,6 +90,57 @@ func mustDuration(name, value string) time.Duration {
 }
 func fatalf(format string, args ...any) { fmt.Fprintf(os.Stderr, format+"\n", args...); os.Exit(1) }
 func logVerbose(enabled bool, format string, args ...any) { if enabled { fmt.Printf("[nfqcooldown] "+format+"\n", args...) } }
+
+func printUsage() {
+    fmt.Fprintf(os.Stderr, `nfqcooldown %s
+
+Experimental NFQUEUE-based TCP SYN pacing daemon.
+
+USAGE:
+    nfqcooldown [OPTIONS]
+
+CORE OPTIONS:
+    --queue <n>                 NFQUEUE number (default: 443)
+    --action <mode>             Action inside cooldown: drop | delay | reject (default: drop)
+    --mode <algorithm>          Cooldown algorithm: fixed | random | jitter (default: fixed)
+
+TIMING:
+    --cooldown <duration>       Base cooldown for fixed/jitter mode (default: 500ms)
+    --min-delay <duration>      Random mode minimum cooldown (default: 300ms)
+    --max-delay <duration>      Random mode maximum cooldown (default: 700ms)
+    --jitter <duration>         Jitter around base cooldown (default: 100ms)
+
+STATE:
+    --cleanup-every <duration>  Cleanup interval (default: 30s)
+    --cleanup-after <duration>  Forget inactive IPs after this duration (default: 10m)
+    --forget-on-drop            Forget source IP state after DROP/REJECT
+    --max-drops-per-ip <n>      Force accept after N consecutive drops; 0 disables
+
+FILTERING:
+    --whitelist <ip,cidr,...>   Comma-separated IP/CIDR whitelist
+
+LOGGING:
+    --stats-every <duration>    Aggregate stats interval (default: 30s)
+    --verbose                   Log every SYN decision
+
+RANDOMNESS:
+    --seed <n>                  Random seed; 0 means current time
+
+OTHER:
+    --help                      Show this help
+    --version                   Show program version
+
+EXAMPLES:
+    nfqcooldown --queue 443 --action drop --mode fixed --cooldown 500ms
+
+    nfqcooldown --queue 443 --action drop --mode random \
+      --min-delay 300ms --max-delay 450ms
+
+    nfqcooldown --queue 443 --action delay --mode jitter \
+      --cooldown 500ms --jitter 100ms
+
+`, Version)
+}
 
 func main() {
 	cfg := parseConfig()

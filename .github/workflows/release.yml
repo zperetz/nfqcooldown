@@ -33,7 +33,9 @@ jobs:
         run: |
           mkdir -p dist
           GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
-            go build -o dist/${{ matrix.name }} ./cmd/nfqcooldown
+            go build -ldflags="-X main.Version=${{ github.ref_name }}" \
+            -o dist/${{ matrix.name }} \
+            ./cmd/nfqcooldown
 
       - name: Package
         run: |
