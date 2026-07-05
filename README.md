@@ -61,7 +61,7 @@ nfqcooldown daemon
 Example iptables rule:
 
 ```bash
-iptables -I INPUT 1 -i eth0 -p tcp --dport 443 \
+sudo iptables -I INPUT 1 -i eth0 -p tcp --dport 443 \
   -m tcp --tcp-flags SYN SYN \
   -j NFQUEUE --queue-num 443 --queue-bypass
 ```
@@ -234,19 +234,19 @@ RestartSec=2
 WantedBy=multi-user.target
 ```
 
-Example `/etc/default/nfqcooldown`:
+Example (best practice)`/etc/default/nfqcooldown`:
 
 ```bash
 QUEUE=443
-ACTION=drop
-MODE=fixed
+ACTION=reject
+MODE=random
 COOLDOWN=500ms
+JITTER=150ms
 MIN_DELAY=550ms
-MAX_DELAY=900ms
-JITTER=100ms
+MAX_DELAY=750ms
 WHITELIST=
 VERBOSE=false
-CLEANUP_EVERY=15s
+CLEANUP_EVERY=30s
 CLEANUP_AFTER=2m
 MAX_DROPS=10
 ```
