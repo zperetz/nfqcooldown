@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+	"strconv"
 
 	core "nfqcooldown/internal"
 
@@ -19,21 +20,22 @@ import (
 var Version = "dev"
 
 type Config struct {
-	QueueNum     uint
-	Action       string
-	Mode         string
-	Cooldown     time.Duration
-	MinDelay     time.Duration
-	MaxDelay     time.Duration
-	Jitter       time.Duration
-	Whitelist    string
-	Verbose      bool
-	Seed         int64
-	StatsEvery   time.Duration
-	CleanupAfter time.Duration
-	CleanupEvery time.Duration
-	ForgetOnDrop bool
-	MaxDropsPerIP int
+	QueueNum       uint
+	Action         string
+	Mode           string
+	Cooldown       time.Duration
+	MinDelay       time.Duration
+	MaxDelay       time.Duration
+	Jitter         time.Duration
+	Whitelist      string
+	Verbose        bool
+	Seed           int64
+	StatsEvery     time.Duration
+	CleanupAfter   time.Duration
+	CleanupEvery   time.Duration
+	ForgetOnDrop   bool
+	MaxDropsPerIP  int
+	RejectMark     int
 }
 
 func parseConfig() Config {
@@ -52,6 +54,7 @@ func parseConfig() Config {
 	cleanupEveryStr := flag.String("cleanup-every", "30s", "cleanup interval")
 	forgetOnDrop := flag.Bool("forget-on-drop", false, "forget source IP state after DROP/REJECT")
 	maxDropsPerIP := flag.Int("max-drops-per-ip", 0, "force accept after N consecutive drops from same IP; 0 disables")
+	rejectMarkStr := flag.String("reject-mark", "0", "packet mark for reject action, e.g. 0x44; 0 disables")
 
 	flag.Usage = printUsage
 
@@ -76,11 +79,16 @@ func parseConfig() Config {
 	cleanupAfter := mustDuration("cleanup-after", *cleanupAfterStr)
 	cleanupEvery := mustDuration("cleanup-every", *cleanupEveryStr)
 
+	rejectMark64, err := strconv.ParseUint(*rejectMarkStr, 0, 32)
+	if err != nil {
+		fatalf("bad reject-mark %q: %v", *rejectMarkStr, err)
+	}
+
 	if *action != "drop" && *action != "delay" && *action != "reject" {
 		fatalf("bad action %q: use drop, delay or reject", *action)
 	}
 
-	return Config{QueueNum: *queueNum, Action: *action, Mode: *mode, Cooldown: cooldown, MinDelay: minDelay, MaxDelay: maxDelay, Jitter: jitter, Whitelist: *whitelist, Verbose: *verbose, Seed: *seed, StatsEvery: statsEvery, MaxDropsPerIP: *maxDropsPerIP, ForgetOnDrop: *forgetOnDrop, CleanupAfter: cleanupAfter, CleanupEvery: cleanupEvery}
+	return Config{QueueNum: *queueNum, Action: *action, Mode: *mode, Cooldown: cooldown, MinDelay: minDelay, MaxDelay: maxDelay, Jitter: jitter, Whitelist: *whitelist, Verbose: *verbose, RejectMark: int(rejectMark64), Seed: *seed, StatsEvery: statsEvery, MaxDropsPerIP: *maxDropsPerIP, ForgetOnDrop: *forgetOnDrop, CleanupAfter: cleanupAfter, CleanupEvery: cleanupEvery}
 }
 
 func mustDuration(name, value string) time.Duration {
@@ -88,8 +96,10 @@ func mustDuration(name, value string) time.Duration {
 	if err != nil { fatalf("bad %s %q: %v", name, value, err) }
 	return d
 }
+
 func fatalf(format string, args ...any) { fmt.Fprintf(os.Stderr, format+"\n", args...); os.Exit(1) }
 func logVerbose(enabled bool, format string, args ...any) { if enabled { fmt.Printf("[nfqcooldown] "+format+"\n", args...) } }
+
 
 func printUsage() {
     fmt.Fprintf(os.Stderr, `nfqcooldown %s
@@ -115,6 +125,7 @@ STATE:
     --cleanup-after <duration>  Forget inactive IPs after this duration (default: 10m)
     --forget-on-drop            Forget source IP state after DROP/REJECT
     --max-drops-per-ip <n>      Force accept after N consecutive drops; 0 disables
+    --reject-mark <mark>        packet mark for reject action, e.g. 0x44; 0 disables
 
 FILTERING:
     --whitelist <ip,cidr,...>   Comma-separated IP/CIDR whitelist
@@ -224,8 +235,12 @@ func main() {
 				srcIP, id, dropCount, cd,
 			    )
 
-			    _ = nf.SetVerdict(id, nfqueue.NfAccept)
-			    return 0
+				if cfg.RejectMark != 0 {
+					_ = nf.SetVerdictWithMark(id, nfqueue.NfAccept, cfg.RejectMark)
+				} else {
+					_ = nf.SetVerdict(id, nfqueue.NfDrop)
+				}			
+				return 0
 			}
 			counters.IncRejected()
 			state.RememberEvent(core.LastEvent{Type: "REJECT-DROP", IP: srcIP, PacketID: id, Cooldown: cooldown, Elapsed: elapsed, Remaining: remaining})
