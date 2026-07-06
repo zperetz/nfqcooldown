@@ -235,11 +235,7 @@ func main() {
 				srcIP, id, dropCount, cd,
 			    )
 
-				if cfg.RejectMark != 0 {
-					_ = nf.SetVerdictWithMark(id, nfqueue.NfAccept, cfg.RejectMark)
-				} else {
-					_ = nf.SetVerdict(id, nfqueue.NfDrop)
-				}			
+				_ = nf.SetVerdict(id, nfqueue.NfAccept)
 				return 0
 			}
 			counters.IncRejected()
@@ -248,7 +244,12 @@ func main() {
 				state.Forget(srcIP)
 			}
 			logVerbose(cfg.Verbose, "REJECT(DROP) ip=%s packet=%d cooldown=%s elapsed=%s remaining=%s", srcIP, id, cooldown, elapsed, remaining)
-			_ = nf.SetVerdict(id, nfqueue.NfDrop); return 0
+			if cfg.RejectMark != 0 {
+				_ = nf.SetVerdictWithMark(id, nfqueue.NfAccept, cfg.RejectMark)
+			} else {
+				_ = nf.SetVerdict(id, nfqueue.NfDrop)
+			}
+			return 0
 		case "delay":
 			counters.IncDelayed()
 			state.RememberEvent(core.LastEvent{Type: "DELAY", IP: srcIP, PacketID: id, Cooldown: cooldown, Elapsed: elapsed, Remaining: remaining})
