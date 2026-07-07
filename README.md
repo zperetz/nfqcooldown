@@ -211,7 +211,9 @@ Verbose mode logs individual packet decisions.
 | `--cleanup-every`    | Remove inactive IPs from memory every `duration`       |
 | `--cleanup-after`    | Remove inactive IPs from memory after `duration`       |
 | `--forget-on-drop`   | Remove IP in case of DROP action                       |
-| `--max-drops-per-ip` | force accept after N consecutive drops from same IP    |
+| `--max-drops-per-ip` | Force accept after N consecutive drops from same IP    |
+| `--reject-mark`      | [EXPERIMENTAL] Reject mark to use in iptables REJECT   |
+
 
 ## systemd service
 
@@ -227,6 +229,7 @@ Wants=network-online.target
 Type=simple
 EnvironmentFile=/etc/default/nfqcooldown
 ExecStart=/usr/local/sbin/nfqcooldown --queue ${QUEUE} --action ${ACTION} --mode ${MODE} --cooldown ${COOLDOWN} --min-delay ${MIN_DELAY} --max-delay ${MAX_DELAY} --jitter ${JITTER} --whitelist ${WHITELIST} --verbose=${VERBOSE}  --cleanup-every=${CLEANUP_EVERY} --cleanup-after=${CLEANUP_AFTER} --max-drops-per-ip ${MAX_DROPS}
+
 Restart=always
 RestartSec=2
 
@@ -242,8 +245,8 @@ ACTION=reject
 MODE=random
 COOLDOWN=500ms
 JITTER=150ms
-MIN_DELAY=550ms
-MAX_DELAY=750ms
+MIN_DELAY=950ms
+MAX_DELAY=1090ms
 WHITELIST=
 VERBOSE=false
 CLEANUP_EVERY=30s
