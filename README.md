@@ -237,7 +237,7 @@ RestartSec=2
 WantedBy=multi-user.target
 ```
 
-Example (best practice)`/etc/default/nfqcooldown`:
+Example (best practice, but ymmv)`/etc/default/nfqcooldown`:
 
 ```bash
 QUEUE=443
