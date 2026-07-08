@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 	"strconv"
+	"sync/atomic"
 
 	core "nfqcooldown/internal"
 
@@ -37,6 +38,7 @@ type Config struct {
 	MaxDropsPerIP  int
 	RejectMark     int
 	Packet         string
+	MaxPendingDelays int
 }
 
 func parseConfig() Config {
@@ -57,6 +59,7 @@ func parseConfig() Config {
 	maxDropsPerIP := flag.Int("max-drops-per-ip", 0, "force accept after N consecutive drops from same IP; 0 disables")
 	rejectMarkStr := flag.String("reject-mark", "0", "packet mark for reject action, e.g. 0x44; 0 disables")
 	packet := flag.String("packet", "syn", "packet type to process: syn or synack")
+	maxPendingDelays := flag.Int("max-pending-delays", 0, "maximum pending delayed packets; 0 disables limit")
 
 	flag.Usage = printUsage
 
@@ -94,7 +97,7 @@ func parseConfig() Config {
 		fatalf("bad packet %q: use syn or synack", *packet)
 	}
 
-	return Config{QueueNum: *queueNum, Packet: *packet, Action: *action, Mode: *mode, Cooldown: cooldown, MinDelay: minDelay, MaxDelay: maxDelay, Jitter: jitter, Whitelist: *whitelist, Verbose: *verbose, RejectMark: int(rejectMark64), Seed: *seed, StatsEvery: statsEvery, MaxDropsPerIP: *maxDropsPerIP, ForgetOnDrop: *forgetOnDrop, CleanupAfter: cleanupAfter, CleanupEvery: cleanupEvery}
+	return Config{QueueNum: *queueNum, Packet: *packet, Action: *action, Mode: *mode, Cooldown: cooldown, MinDelay: minDelay, MaxDelay: maxDelay, Jitter: jitter, Whitelist: *whitelist, Verbose: *verbose, RejectMark: int(rejectMark64), Seed: *seed, StatsEvery: statsEvery, MaxDropsPerIP: *maxDropsPerIP, ForgetOnDrop: *forgetOnDrop, CleanupAfter: cleanupAfter, CleanupEvery: cleanupEvery, MaxPendingDelays: *maxPendingDelays}
 }
 
 func mustDuration(name, value string) time.Duration {
@@ -119,7 +122,7 @@ CORE OPTIONS:
     --queue <n>                 NFQUEUE number (default: 443)
     --action <mode>             Action inside cooldown: drop | delay | reject (default: drop)
     --mode <algorithm>          Cooldown algorithm: fixed | random | jitter (default: fixed)
-    --packet <syn|synack>         packet type to process (default: syn)
+    --packet <syn|synack>       Packet type to process (default: syn)
 
 TIMING:
     --cooldown <duration>       Base cooldown for fixed/jitter mode (default: 500ms)
@@ -184,6 +187,7 @@ func main() {
 	go cleanupLoop(ctx, state, cfg.CleanupEvery, cfg.CleanupAfter)
 	go statsLoop(ctx, cfg, state, counters)
 
+	var pendingDelays int64
 	handler := func(a nfqueue.Attribute) int {
 		if a.PacketID == nil { return 0 }
 		id := *a.PacketID
@@ -278,7 +282,37 @@ func main() {
 			counters.IncDelayed()
 			state.RememberEvent(core.LastEvent{Type: "DELAY", IP: srcIP, PacketID: id, Cooldown: cooldown, Elapsed: elapsed, Remaining: remaining})
 			logVerbose(cfg.Verbose, "DELAY ip=%s packet=%d cooldown=%s elapsed=%s remaining=%s", srcIP, id, cooldown, elapsed, remaining)
+
+			if cfg.MaxPendingDelays > 0 && atomic.LoadInt64(&pendingDelays) >= int64(cfg.MaxPendingDelays) {
+				counters.IncDelayOverflowDropped()
+
+				state.RememberEvent(core.LastEvent{
+					Type:      "DELAY-OVERFLOW-DROP",
+					IP:        srcIP,
+					PacketID:  id,
+					Cooldown:  cooldown,
+					Elapsed:   elapsed,
+					Remaining: remaining,
+				})
+				logVerbose(
+					cfg.Verbose,
+					"DELAY ip=%s packet=%d pending=%d cooldown=%s elapsed=%s remaining=%s",
+					srcIP,
+					id,
+					atomic.LoadInt64(&pendingDelays),
+					cooldown,
+					elapsed,
+					remaining,
+				)
+				_ = nf.SetVerdict(id, nfqueue.NfDrop)
+				return 0
+			}
+
+			counters.IncDelayed()
+			atomic.AddInt64(&pendingDelays, 1)
+
 			go func(packetID uint32, ip string, delay time.Duration) {
+				defer atomic.AddInt64(&pendingDelays, -1)
 				time.Sleep(delay)
 				cd, _ := state.MarkDelayedAccept(ip, time.Now(), packetID, delay)
 				counters.IncAccepted()
