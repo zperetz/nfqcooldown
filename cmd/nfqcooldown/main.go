@@ -36,6 +36,7 @@ type Config struct {
 	ForgetOnDrop   bool
 	MaxDropsPerIP  int
 	RejectMark     int
+	Packet         string
 }
 
 func parseConfig() Config {
@@ -55,6 +56,7 @@ func parseConfig() Config {
 	forgetOnDrop := flag.Bool("forget-on-drop", false, "forget source IP state after DROP/REJECT")
 	maxDropsPerIP := flag.Int("max-drops-per-ip", 0, "force accept after N consecutive drops from same IP; 0 disables")
 	rejectMarkStr := flag.String("reject-mark", "0", "packet mark for reject action, e.g. 0x44; 0 disables")
+	packet := flag.String("packet", "syn", "packet type to process: syn or synack")
 
 	flag.Usage = printUsage
 
@@ -88,7 +90,11 @@ func parseConfig() Config {
 		fatalf("bad action %q: use drop, delay or reject", *action)
 	}
 
-	return Config{QueueNum: *queueNum, Action: *action, Mode: *mode, Cooldown: cooldown, MinDelay: minDelay, MaxDelay: maxDelay, Jitter: jitter, Whitelist: *whitelist, Verbose: *verbose, RejectMark: int(rejectMark64), Seed: *seed, StatsEvery: statsEvery, MaxDropsPerIP: *maxDropsPerIP, ForgetOnDrop: *forgetOnDrop, CleanupAfter: cleanupAfter, CleanupEvery: cleanupEvery}
+	if *packet != "syn" && *packet != "synack" {
+		fatalf("bad packet %q: use syn or synack", *packet)
+	}
+
+	return Config{QueueNum: *queueNum, Packet: *packet, Action: *action, Mode: *mode, Cooldown: cooldown, MinDelay: minDelay, MaxDelay: maxDelay, Jitter: jitter, Whitelist: *whitelist, Verbose: *verbose, RejectMark: int(rejectMark64), Seed: *seed, StatsEvery: statsEvery, MaxDropsPerIP: *maxDropsPerIP, ForgetOnDrop: *forgetOnDrop, CleanupAfter: cleanupAfter, CleanupEvery: cleanupEvery}
 }
 
 func mustDuration(name, value string) time.Duration {
@@ -113,6 +119,7 @@ CORE OPTIONS:
     --queue <n>                 NFQUEUE number (default: 443)
     --action <mode>             Action inside cooldown: drop | delay | reject (default: drop)
     --mode <algorithm>          Cooldown algorithm: fixed | random | jitter (default: fixed)
+    --packet <syn|synack>         packet type to process (default: syn)
 
 TIMING:
     --cooldown <duration>       Base cooldown for fixed/jitter mode (default: 500ms)
@@ -182,8 +189,25 @@ func main() {
 		id := *a.PacketID
 		if a.Payload == nil { _ = nf.SetVerdict(id, nfqueue.NfAccept); return 0 }
 
-		srcIP, isSyn := core.ParseIPv4PureTCPSYN(*a.Payload)
-		if !isSyn { _ = nf.SetVerdict(id, nfqueue.NfAccept); return 0 }
+		var srcIP string
+		var matched bool
+
+		switch cfg.Packet {
+		case "syn":
+			srcIP, matched = core.ParseIPv4PureTCPSYN(*a.Payload)
+
+		case "synack":
+			info, ok := core.ParseIPv4TCPSYNACK(*a.Payload)
+			if ok {
+				srcIP = info.ClientIP
+				matched = true
+			}
+		}
+
+		if !matched {
+			_ = nf.SetVerdict(id, nfqueue.NfAccept)
+			return 0
+		}
 
 		if whitelist.Contains(srcIP) {
 			ev := core.LastEvent{Type: "ACCEPT-WHITELIST", IP: srcIP, PacketID: id}
