@@ -11,6 +11,7 @@ import (
 	"time"
 	"strconv"
 	"sync/atomic"
+	"sync"
 
 	core "nfqcooldown/internal"
 
@@ -39,6 +40,9 @@ type Config struct {
 	RejectMark     int
 	Packet         string
 	MaxPendingDelays int
+	DelayStrategy  string
+	PaceInterval   time.Duration
+	MaxQueuedDelay time.Duration
 }
 
 func parseConfig() Config {
@@ -60,6 +64,9 @@ func parseConfig() Config {
 	rejectMarkStr := flag.String("reject-mark", "0", "packet mark for reject action, e.g. 0x44; 0 disables")
 	packet := flag.String("packet", "syn", "packet type to process: syn or synack")
 	maxPendingDelays := flag.Int("max-pending-delays", 0, "maximum pending delayed packets; 0 disables limit")
+	delayStrategy := flag.String("delay-strategy", "sleep", "delay strategy: sleep or pace")
+	paceIntervalStr := flag.String("pace-interval", "250ms", "interval between paced delayed packets")
+	maxQueuedDelayStr := flag.String("max-queued-delay", "0", "maximum queued delay for pace strategy; 0 disables")
 
 	flag.Usage = printUsage
 
@@ -83,6 +90,9 @@ func parseConfig() Config {
 	statsEvery := mustDuration("stats-every", *statsEveryStr)
 	cleanupAfter := mustDuration("cleanup-after", *cleanupAfterStr)
 	cleanupEvery := mustDuration("cleanup-every", *cleanupEveryStr)
+	paceInterval := mustDuration("pace-interval", *paceIntervalStr)
+	maxQueuedDelay := mustDuration("max-queued-delay", *maxQueuedDelayStr)
+
 
 	rejectMark64, err := strconv.ParseUint(*rejectMarkStr, 0, 32)
 	if err != nil {
@@ -97,7 +107,33 @@ func parseConfig() Config {
 		fatalf("bad packet %q: use syn or synack", *packet)
 	}
 
-	return Config{QueueNum: *queueNum, Packet: *packet, Action: *action, Mode: *mode, Cooldown: cooldown, MinDelay: minDelay, MaxDelay: maxDelay, Jitter: jitter, Whitelist: *whitelist, Verbose: *verbose, RejectMark: int(rejectMark64), Seed: *seed, StatsEvery: statsEvery, MaxDropsPerIP: *maxDropsPerIP, ForgetOnDrop: *forgetOnDrop, CleanupAfter: cleanupAfter, CleanupEvery: cleanupEvery, MaxPendingDelays: *maxPendingDelays}
+	if *delayStrategy != "sleep" && *delayStrategy != "pace" {
+		fatalf("bad delay-strategy %q: use sleep or pace", *delayStrategy)
+	}
+
+	return Config{
+		QueueNum: *queueNum,
+		Packet: *packet,
+		Action: *action,
+		Mode: *mode,
+		Cooldown: cooldown,
+		MinDelay: minDelay,
+		MaxDelay: maxDelay,
+		Jitter: jitter,
+		Whitelist: *whitelist,
+		Verbose: *verbose,
+		RejectMark: int(rejectMark64),
+		Seed: *seed,
+		StatsEvery: statsEvery,
+		MaxDropsPerIP: *maxDropsPerIP,
+		ForgetOnDrop: *forgetOnDrop,
+		CleanupAfter: cleanupAfter,
+		CleanupEvery: cleanupEvery,
+		MaxPendingDelays: *maxPendingDelays,
+		DelayStrategy:  *delayStrategy,
+		PaceInterval:   paceInterval,
+		MaxQueuedDelay: maxQueuedDelay,
+	}
 }
 
 func mustDuration(name, value string) time.Duration {
@@ -188,6 +224,7 @@ func main() {
 	go statsLoop(ctx, cfg, state, counters)
 
 	var pendingDelays int64
+	var nextSendAtByIP sync.Map
 	handler := func(a nfqueue.Attribute) int {
 		if a.PacketID == nil { return 0 }
 		id := *a.PacketID
@@ -279,7 +316,6 @@ func main() {
 			}
 			return 0
 		case "delay":
-			counters.IncDelayed()
 			state.RememberEvent(core.LastEvent{Type: "DELAY", IP: srcIP, PacketID: id, Cooldown: cooldown, Elapsed: elapsed, Remaining: remaining})
 			logVerbose(cfg.Verbose, "DELAY ip=%s packet=%d cooldown=%s elapsed=%s remaining=%s", srcIP, id, cooldown, elapsed, remaining)
 
@@ -309,6 +345,46 @@ func main() {
 			}
 
 			counters.IncDelayed()
+
+			actualDelay := remaining
+
+			if cfg.DelayStrategy == "pace" {
+				now := time.Now()
+
+				v, _ := nextSendAtByIP.LoadOrStore(srcIP, now)
+				nextSendAt := v.(time.Time)
+
+				if nextSendAt.Before(now) {
+					nextSendAt = now
+				}
+
+				sendAt := nextSendAt.Add(cfg.PaceInterval)
+				actualDelay = time.Until(sendAt)
+
+				if cfg.MaxQueuedDelay > 0 && actualDelay > cfg.MaxQueuedDelay {
+					counters.IncDelayOverflowDropped()
+
+					state.RememberEvent(core.LastEvent{
+						Type:      "PACE-OVERFLOW-DROP",
+						IP:        srcIP,
+						PacketID:  id,
+						Cooldown:  cooldown,
+						Elapsed:   elapsed,
+						Remaining: actualDelay,
+					})
+
+					logVerbose(cfg.Verbose,
+						"PACE-OVERFLOW-DROP ip=%s packet=%d queued_delay=%s max_queued_delay=%s",
+						srcIP, id, actualDelay, cfg.MaxQueuedDelay,
+					)
+
+					_ = nf.SetVerdict(id, nfqueue.NfDrop)
+					return 0
+				}
+
+				nextSendAtByIP.Store(srcIP, sendAt)
+			}
+
 			atomic.AddInt64(&pendingDelays, 1)
 
 			go func(packetID uint32, ip string, delay time.Duration) {
@@ -316,9 +392,18 @@ func main() {
 				time.Sleep(delay)
 				cd, _ := state.MarkDelayedAccept(ip, time.Now(), packetID, delay)
 				counters.IncAccepted()
-				logVerbose(cfg.Verbose, "ACCEPT-AFTER-DELAY ip=%s packet=%d waited=%s new_cooldown=%s", ip, packetID, delay, cd)
-				_ = nf.SetVerdict(packetID, nfqueue.NfAccept)
-			}(id, srcIP, remaining)
+
+				logVerbose(cfg.Verbose,
+					"ACCEPT-AFTER-DELAY ip=%s packet=%d strategy=%s waited=%s new_cooldown=%s pending=%d",
+					ip,
+					packetID,
+					cfg.DelayStrategy,
+					delay,
+					cd,
+					atomic.LoadInt64(&pendingDelays),
+				)
+
+				_ = nf.SetVerdict(packetID, nfqueue.NfAccept)			}(id, srcIP, actualDelay)
 			return 0
 		}
 		_ = nf.SetVerdict(id, nfqueue.NfAccept); return 0
