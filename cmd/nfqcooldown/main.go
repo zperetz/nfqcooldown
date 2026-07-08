@@ -7,11 +7,11 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"strconv"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
-	"strconv"
-	"sync/atomic"
-	"sync"
 
 	core "nfqcooldown/internal"
 
@@ -22,27 +22,27 @@ import (
 var Version = "dev"
 
 type Config struct {
-	QueueNum       uint
-	Action         string
-	Mode           string
-	Cooldown       time.Duration
-	MinDelay       time.Duration
-	MaxDelay       time.Duration
-	Jitter         time.Duration
-	Whitelist      string
-	Verbose        bool
-	Seed           int64
-	StatsEvery     time.Duration
-	CleanupAfter   time.Duration
-	CleanupEvery   time.Duration
-	ForgetOnDrop   bool
-	MaxDropsPerIP  int
-	RejectMark     int
-	Packet         string
+	QueueNum         uint
+	Action           string
+	Mode             string
+	Cooldown         time.Duration
+	MinDelay         time.Duration
+	MaxDelay         time.Duration
+	Jitter           time.Duration
+	Whitelist        string
+	Verbose          bool
+	Seed             int64
+	StatsEvery       time.Duration
+	CleanupAfter     time.Duration
+	CleanupEvery     time.Duration
+	ForgetOnDrop     bool
+	MaxDropsPerIP    int
+	RejectMark       int
+	Packet           string
 	MaxPendingDelays int
-	DelayStrategy  string
-	PaceInterval   time.Duration
-	MaxQueuedDelay time.Duration
+	DelayStrategy    string
+	PaceInterval     time.Duration
+	MaxQueuedDelay   time.Duration
 }
 
 func parseConfig() Config {
@@ -71,14 +71,14 @@ func parseConfig() Config {
 	flag.Usage = printUsage
 
 	for _, arg := range os.Args[1:] {
-	    switch arg {
-	    case "--help":
-		printUsage()
-		os.Exit(0)
-	    case "--version":
-		fmt.Printf("nfqcooldown %s\n", Version)
-		os.Exit(0)
-	    }
+		switch arg {
+		case "--help":
+			printUsage()
+			os.Exit(0)
+		case "--version":
+			fmt.Printf("nfqcooldown %s\n", Version)
+			os.Exit(0)
+		}
 	}
 
 	flag.Parse()
@@ -92,7 +92,6 @@ func parseConfig() Config {
 	cleanupEvery := mustDuration("cleanup-every", *cleanupEveryStr)
 	paceInterval := mustDuration("pace-interval", *paceIntervalStr)
 	maxQueuedDelay := mustDuration("max-queued-delay", *maxQueuedDelayStr)
-
 
 	rejectMark64, err := strconv.ParseUint(*rejectMarkStr, 0, 32)
 	if err != nil {
@@ -112,42 +111,47 @@ func parseConfig() Config {
 	}
 
 	return Config{
-		QueueNum: *queueNum,
-		Packet: *packet,
-		Action: *action,
-		Mode: *mode,
-		Cooldown: cooldown,
-		MinDelay: minDelay,
-		MaxDelay: maxDelay,
-		Jitter: jitter,
-		Whitelist: *whitelist,
-		Verbose: *verbose,
-		RejectMark: int(rejectMark64),
-		Seed: *seed,
-		StatsEvery: statsEvery,
-		MaxDropsPerIP: *maxDropsPerIP,
-		ForgetOnDrop: *forgetOnDrop,
-		CleanupAfter: cleanupAfter,
-		CleanupEvery: cleanupEvery,
+		QueueNum:         *queueNum,
+		Packet:           *packet,
+		Action:           *action,
+		Mode:             *mode,
+		Cooldown:         cooldown,
+		MinDelay:         minDelay,
+		MaxDelay:         maxDelay,
+		Jitter:           jitter,
+		Whitelist:        *whitelist,
+		Verbose:          *verbose,
+		RejectMark:       int(rejectMark64),
+		Seed:             *seed,
+		StatsEvery:       statsEvery,
+		MaxDropsPerIP:    *maxDropsPerIP,
+		ForgetOnDrop:     *forgetOnDrop,
+		CleanupAfter:     cleanupAfter,
+		CleanupEvery:     cleanupEvery,
 		MaxPendingDelays: *maxPendingDelays,
-		DelayStrategy:  *delayStrategy,
-		PaceInterval:   paceInterval,
-		MaxQueuedDelay: maxQueuedDelay,
+		DelayStrategy:    *delayStrategy,
+		PaceInterval:     paceInterval,
+		MaxQueuedDelay:   maxQueuedDelay,
 	}
 }
 
 func mustDuration(name, value string) time.Duration {
 	d, err := time.ParseDuration(value)
-	if err != nil { fatalf("bad %s %q: %v", name, value, err) }
+	if err != nil {
+		fatalf("bad %s %q: %v", name, value, err)
+	}
 	return d
 }
 
 func fatalf(format string, args ...any) { fmt.Fprintf(os.Stderr, format+"\n", args...); os.Exit(1) }
-func logVerbose(enabled bool, format string, args ...any) { if enabled { fmt.Printf("[nfqcooldown] "+format+"\n", args...) } }
-
+func logVerbose(enabled bool, format string, args ...any) {
+	if enabled {
+		fmt.Printf("[nfqcooldown] "+format+"\n", args...)
+	}
+}
 
 func printUsage() {
-    fmt.Fprintf(os.Stderr, `nfqcooldown %s
+	fmt.Fprintf(os.Stderr, `nfqcooldown %s
 
 Experimental NFQUEUE-based TCP SYN pacing daemon.
 
@@ -201,20 +205,28 @@ EXAMPLES:
 
 func main() {
 	cfg := parseConfig()
-	if cfg.Seed == 0 { cfg.Seed = time.Now().UnixNano() }
+	if cfg.Seed == 0 {
+		cfg.Seed = time.Now().UnixNano()
+	}
 	rand.Seed(cfg.Seed)
 
 	algorithm, err := core.NewAlgorithm(cfg.Mode, cfg.Cooldown, cfg.MinDelay, cfg.MaxDelay, cfg.Jitter)
-	if err != nil { fatalf("%v", err) }
+	if err != nil {
+		fatalf("%v", err)
+	}
 	whitelist, err := core.NewWhitelist(cfg.Whitelist)
-	if err != nil { fatalf("%v", err) }
+	if err != nil {
+		fatalf("%v", err)
+	}
 
 	state := core.NewState(algorithm)
 	counters := &core.Counters{}
 
 	nfqConfig := nfqueue.Config{NfQueue: uint16(cfg.QueueNum), MaxPacketLen: 0xffff, MaxQueueLen: 8192, Copymode: nfqueue.NfQnlCopyPacket, WriteTimeout: 15 * time.Millisecond}
 	nf, err := nfqueue.Open(&nfqConfig)
-	if err != nil { fatalf("could not open nfqueue: %v", err) }
+	if err != nil {
+		fatalf("could not open nfqueue: %v", err)
+	}
 	defer nf.Close()
 	_ = nf.SetOption(netlink.NoENOBUFS, true)
 
@@ -225,10 +237,16 @@ func main() {
 
 	var pendingDelays int64
 	var nextSendAtByIP sync.Map
+	var singlePendingByIP sync.Map
 	handler := func(a nfqueue.Attribute) int {
-		if a.PacketID == nil { return 0 }
+		if a.PacketID == nil {
+			return 0
+		}
 		id := *a.PacketID
-		if a.Payload == nil { _ = nf.SetVerdict(id, nfqueue.NfAccept); return 0 }
+		if a.Payload == nil {
+			_ = nf.SetVerdict(id, nfqueue.NfAccept)
+			return 0
+		}
 
 		var srcIP string
 		var matched bool
@@ -252,9 +270,11 @@ func main() {
 
 		if whitelist.Contains(srcIP) {
 			ev := core.LastEvent{Type: "ACCEPT-WHITELIST", IP: srcIP, PacketID: id}
-			state.RememberEvent(ev); counters.IncAccepted()
+			state.RememberEvent(ev)
+			counters.IncAccepted()
 			logVerbose(cfg.Verbose, "ACCEPT-WHITELIST ip=%s packet=%d", srcIP, id)
-			_ = nf.SetVerdict(id, nfqueue.NfAccept); return 0
+			_ = nf.SetVerdict(id, nfqueue.NfAccept)
+			return 0
 		}
 
 		now := time.Now()
@@ -262,7 +282,8 @@ func main() {
 		if allowed {
 			counters.IncAccepted()
 			logVerbose(cfg.Verbose, "ACCEPT ip=%s packet=%d elapsed=%s new_cooldown=%s", srcIP, id, elapsed, cooldown)
-			_ = nf.SetVerdict(id, nfqueue.NfAccept); return 0
+			_ = nf.SetVerdict(id, nfqueue.NfAccept)
+			return 0
 		}
 
 		switch cfg.Action {
@@ -270,16 +291,16 @@ func main() {
 			dropCount := state.IncDrop(srcIP)
 
 			if cfg.MaxDropsPerIP > 0 && dropCount > cfg.MaxDropsPerIP {
-			    cd, _ := state.ForceAccept(srcIP, time.Now(), id)
-			    counters.IncAccepted()
+				cd, _ := state.ForceAccept(srcIP, time.Now(), id)
+				counters.IncAccepted()
 
-			    logVerbose(cfg.Verbose,
-				"FORCE-ACCEPT ip=%s packet=%d drops=%d new_cooldown=%s",
-				srcIP, id, dropCount, cd,
-			    )
+				logVerbose(cfg.Verbose,
+					"FORCE-ACCEPT ip=%s packet=%d drops=%d new_cooldown=%s",
+					srcIP, id, dropCount, cd,
+				)
 
-			    _ = nf.SetVerdict(id, nfqueue.NfAccept)
-			    return 0
+				_ = nf.SetVerdict(id, nfqueue.NfAccept)
+				return 0
 			}
 			counters.IncDropped()
 			state.RememberEvent(core.LastEvent{Type: "DROP", IP: srcIP, PacketID: id, Cooldown: cooldown, Elapsed: elapsed, Remaining: remaining})
@@ -287,18 +308,19 @@ func main() {
 				state.Forget(srcIP)
 			}
 			logVerbose(cfg.Verbose, "DROP ip=%s packet=%d cooldown=%s elapsed=%s remaining=%s", srcIP, id, cooldown, elapsed, remaining)
-			_ = nf.SetVerdict(id, nfqueue.NfDrop); return 0
+			_ = nf.SetVerdict(id, nfqueue.NfDrop)
+			return 0
 		case "reject":
 			dropCount := state.IncDrop(srcIP)
 
 			if cfg.MaxDropsPerIP > 0 && dropCount > cfg.MaxDropsPerIP {
-			    cd, _ := state.ForceAccept(srcIP, time.Now(), id)
-			    counters.IncAccepted()
+				cd, _ := state.ForceAccept(srcIP, time.Now(), id)
+				counters.IncAccepted()
 
-			    logVerbose(cfg.Verbose,
-				"FORCE-ACCEPT ip=%s packet=%d drops=%d new_cooldown=%s",
-				srcIP, id, dropCount, cd,
-			    )
+				logVerbose(cfg.Verbose,
+					"FORCE-ACCEPT ip=%s packet=%d drops=%d new_cooldown=%s",
+					srcIP, id, dropCount, cd,
+				)
 
 				_ = nf.SetVerdict(id, nfqueue.NfAccept)
 				return 0
@@ -385,9 +407,36 @@ func main() {
 				nextSendAtByIP.Store(srcIP, sendAt)
 			}
 
+			releaseSingle := false
+
+			if cfg.DelayStrategy == "single" {
+				if _, loaded := singlePendingByIP.LoadOrStore(srcIP, true); loaded {
+					counters.IncDelayOverflowDropped()
+
+					state.RememberEvent(core.LastEvent{
+						Type:      "SINGLE-PENDING-DROP",
+						IP:        srcIP,
+						PacketID:  id,
+						Cooldown:  cooldown,
+						Elapsed:   elapsed,
+						Remaining: remaining,
+					})
+
+					logVerbose(cfg.Verbose,
+						"SINGLE-PENDING-DROP ip=%s packet=%d cooldown=%s elapsed=%s remaining=%s",
+						srcIP, id, cooldown, elapsed, remaining,
+					)
+
+					_ = nf.SetVerdict(id, nfqueue.NfDrop)
+					return 0
+				}
+
+				releaseSingle = true
+			}
+
 			atomic.AddInt64(&pendingDelays, 1)
 
-			go func(packetID uint32, ip string, delay time.Duration) {
+			go func(packetID uint32, ip string, delay time.Duration, releaseSingle bool) {
 				defer atomic.AddInt64(&pendingDelays, -1)
 				time.Sleep(delay)
 				cd, _ := state.MarkDelayedAccept(ip, time.Now(), packetID, delay)
@@ -403,15 +452,23 @@ func main() {
 					atomic.LoadInt64(&pendingDelays),
 				)
 
-				_ = nf.SetVerdict(packetID, nfqueue.NfAccept)			}(id, srcIP, actualDelay)
+				_ = nf.SetVerdict(packetID, nfqueue.NfAccept)
+
+				if releaseSingle {
+					singlePendingByIP.Delete(ip)
+				}
+			}(id, srcIP, actualDelay, releaseSingle)
 			return 0
 		}
-		_ = nf.SetVerdict(id, nfqueue.NfAccept); return 0
+		_ = nf.SetVerdict(id, nfqueue.NfAccept)
+		return 0
 	}
 
 	fmt.Printf("[nfqcooldown] started queue=%d action=%s mode=%s cooldown=%s min=%s max=%s jitter=%s whitelist=%d verbose=%v seed=%d\n", cfg.QueueNum, cfg.Action, cfg.Mode, cfg.Cooldown, cfg.MinDelay, cfg.MaxDelay, cfg.Jitter, whitelist.Len(), cfg.Verbose, cfg.Seed)
 	err = nf.RegisterWithErrorFunc(ctx, handler, func(e error) int { fmt.Fprintf(os.Stderr, "nfqueue error: %v\n", e); return 0 })
-	if err != nil { fatalf("register failed: %v", err) }
+	if err != nil {
+		fatalf("register failed: %v", err)
+	}
 	<-ctx.Done()
 }
 
@@ -433,12 +490,16 @@ func cleanupLoop(ctx context.Context, state *core.State, every, ttl time.Duratio
 }
 
 func statsLoop(ctx context.Context, cfg Config, state *core.State, counters *core.Counters) {
-	t := time.NewTicker(cfg.StatsEvery); defer t.Stop()
+	t := time.NewTicker(cfg.StatsEvery)
+	defer t.Stop()
 	for {
 		select {
-		case <-ctx.Done(): return
+		case <-ctx.Done():
+			return
 		case <-t.C:
-			if cfg.Verbose { continue }
+			if cfg.Verbose {
+				continue
+			}
 			tracked, ev := state.Snapshot()
 			accepted, delayed, dropped, rejected := counters.Snapshot()
 			fmt.Printf("[nfqcooldown] accepted=%d delayed=%d dropped=%d rejected=%d tracked_ips=%d action=%s mode=%s cooldown=%s min=%s max=%s jitter=%s last=%s ip=%s packet=%d actual_cooldown=%s elapsed=%s remaining=%s\n", accepted, delayed, dropped, rejected, tracked, cfg.Action, cfg.Mode, cfg.Cooldown, cfg.MinDelay, cfg.MaxDelay, cfg.Jitter, ev.Type, ev.IP, ev.PacketID, ev.Cooldown, ev.Elapsed, ev.Remaining)
