@@ -107,8 +107,8 @@ func parseConfig() Config {
 		fatalf("bad packet %q: use syn or synack", *packet)
 	}
 
-	if *delayStrategy != "sleep" && *delayStrategy != "pace" {
-		fatalf("bad delay-strategy %q: use sleep or pace", *delayStrategy)
+	if *delayStrategy != "sleep" && *delayStrategy != "pace" && *delayStrategy != "single" {
+		fatalf("bad delay-strategy %q: use sleep, pace or single", *delayStrategy)
 	}
 
 	return Config{
