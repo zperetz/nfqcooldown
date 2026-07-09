@@ -426,6 +426,8 @@ func main() {
 					}
 
 					if cfg.SingleDropRepeats > 0 && dropCount >= cfg.SingleDropRepeats {
+						singleDropCountByIP.Store(srcIP, 0)
+
 						counters.IncAccepted()
 
 						state.RememberEvent(core.LastEvent{
