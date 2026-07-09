@@ -42,6 +42,8 @@ type Config struct {
 	MaxPendingDelays  int
 	DelayStrategy     string
 	SingleDropRepeats int
+	DelayStep         time.Duration
+	DelayMax          time.Duration
 	PaceInterval      time.Duration
 	MaxQueuedDelay    time.Duration
 }
@@ -65,8 +67,10 @@ func parseConfig() Config {
 	rejectMarkStr := flag.String("reject-mark", "0", "packet mark for reject action, e.g. 0x44; 0 disables")
 	packet := flag.String("packet", "syn", "packet type to process: syn or synack")
 	maxPendingDelays := flag.Int("max-pending-delays", 0, "maximum pending delayed packets; 0 disables limit")
-	delayStrategy := flag.String("delay-strategy", "sleep", "delay strategy: sleep, pace or single")
+	delayStrategy := flag.String("delay-strategy", "sleep", "delay strategy: sleep, pace, single or staircase")
 	singleDropRepeats := flag.Int("single-drop-repeats", 0, "for single strategy: drop first N packets while delay is pending; 0 drops all")
+	delayStepStr := flag.String("delay-step", "50ms", "for staircase strategy: increase delay by this step after each packet")
+	delayMaxStr := flag.String("delay-max", "0", "for staircase strategy: maximum delay before dropping; 0 disables")
 	paceIntervalStr := flag.String("pace-interval", "250ms", "interval between paced delayed packets")
 	maxQueuedDelayStr := flag.String("max-queued-delay", "0", "maximum queued delay for pace strategy; 0 disables")
 
@@ -92,6 +96,8 @@ func parseConfig() Config {
 	statsEvery := mustDuration("stats-every", *statsEveryStr)
 	cleanupAfter := mustDuration("cleanup-after", *cleanupAfterStr)
 	cleanupEvery := mustDuration("cleanup-every", *cleanupEveryStr)
+	delayStep := mustDuration("delay-step", *delayStepStr)
+	delayMax := mustDuration("delay-max", *delayMaxStr)
 	paceInterval := mustDuration("pace-interval", *paceIntervalStr)
 	maxQueuedDelay := mustDuration("max-queued-delay", *maxQueuedDelayStr)
 
@@ -108,8 +114,12 @@ func parseConfig() Config {
 		fatalf("bad packet %q: use syn or synack", *packet)
 	}
 
-	if *delayStrategy != "sleep" && *delayStrategy != "pace" && *delayStrategy != "single" {
-		fatalf("bad delay-strategy %q: use sleep, pace or single", *delayStrategy)
+	if *delayStrategy != "sleep" && *delayStrategy != "pace" && *delayStrategy != "single" && *delayStrategy != "staircase" {
+		fatalf("bad delay-strategy %q: use sleep, pace, single or staircase", *delayStrategy)
+	}
+
+	if *delayStrategy == "staircase" && delayStep <= 0 {
+		fatalf("bad delay-step %q: must be > 0 for staircase strategy", *delayStepStr)
 	}
 
 	if *singleDropRepeats < 0 {
@@ -137,6 +147,8 @@ func parseConfig() Config {
 		MaxPendingDelays:  *maxPendingDelays,
 		DelayStrategy:     *delayStrategy,
 		SingleDropRepeats: *singleDropRepeats,
+		DelayStep:         delayStep,
+		DelayMax:          delayMax,
 		PaceInterval:      paceInterval,
 		MaxQueuedDelay:    maxQueuedDelay,
 	}
@@ -176,6 +188,8 @@ TIMING:
     --min-delay <duration>      Random mode minimum cooldown (default: 300ms)
     --max-delay <duration>      Random mode maximum cooldown (default: 700ms)
     --jitter <duration>         Jitter around base cooldown (default: 100ms)
+    --delay-step <duration>     Staircase step added after each packet (default: 50ms)
+    --delay-max <duration>      Staircase maximum delay before DROP; 0 disables
 
 STATE:
     --cleanup-every <duration>  Cleanup interval (default: 30s)
@@ -243,10 +257,16 @@ func main() {
 	go cleanupLoop(ctx, state, cfg.CleanupEvery, cfg.CleanupAfter)
 	go statsLoop(ctx, cfg, state, counters)
 
+	type staircaseState struct {
+		NextDelay time.Duration
+		LastSeen  time.Time
+	}
+
 	var pendingDelays int64
 	var nextSendAtByIP sync.Map
 	var singlePendingByIP sync.Map
 	var singleDropCountByIP sync.Map
+	var staircaseByIP sync.Map
 	handler := func(a nfqueue.Attribute) int {
 		if a.PacketID == nil {
 			return 0
@@ -414,6 +434,52 @@ func main() {
 				}
 
 				nextSendAtByIP.Store(srcIP, sendAt)
+			}
+
+			if cfg.DelayStrategy == "staircase" {
+				now := time.Now()
+				st := staircaseState{NextDelay: cfg.MinDelay, LastSeen: now}
+
+				if v, ok := staircaseByIP.Load(srcIP); ok {
+					st = v.(staircaseState)
+					if cfg.CleanupAfter > 0 && now.Sub(st.LastSeen) > cfg.CleanupAfter {
+						st.NextDelay = cfg.MinDelay
+					}
+				}
+
+				actualDelay = st.NextDelay
+
+				if cfg.DelayMax > 0 && actualDelay > cfg.DelayMax {
+					st.LastSeen = now
+					staircaseByIP.Store(srcIP, st)
+					counters.IncDelayOverflowDropped()
+
+					state.RememberEvent(core.LastEvent{
+						Type:      "STAIRCASE-DROP",
+						IP:        srcIP,
+						PacketID:  id,
+						Cooldown:  cooldown,
+						Elapsed:   elapsed,
+						Remaining: actualDelay,
+					})
+
+					logVerbose(cfg.Verbose,
+						"STAIRCASE-DROP ip=%s packet=%d delay=%s delay_max=%s elapsed=%s",
+						srcIP, id, actualDelay, cfg.DelayMax, elapsed,
+					)
+
+					_ = nf.SetVerdict(id, nfqueue.NfDrop)
+					return 0
+				}
+
+				st.NextDelay = actualDelay + cfg.DelayStep
+				st.LastSeen = now
+				staircaseByIP.Store(srcIP, st)
+
+				logVerbose(cfg.Verbose,
+					"STAIRCASE-DELAY ip=%s packet=%d delay=%s next_delay=%s delay_step=%s delay_max=%s",
+					srcIP, id, actualDelay, st.NextDelay, cfg.DelayStep, cfg.DelayMax,
+				)
 			}
 
 			releaseSingle := false
