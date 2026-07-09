@@ -258,8 +258,8 @@ func main() {
 	go statsLoop(ctx, cfg, state, counters)
 
 	type staircaseState struct {
-		NextDelay time.Duration
-		LastSeen  time.Time
+		CurrentDelay time.Duration
+		LastSeen     time.Time
 	}
 
 	var pendingDelays int64
@@ -438,16 +438,16 @@ func main() {
 
 			if cfg.DelayStrategy == "staircase" {
 				now := time.Now()
-				st := staircaseState{NextDelay: cfg.MinDelay, LastSeen: now}
+				st := staircaseState{CurrentDelay: cfg.MinDelay, LastSeen: now}
 
 				if v, ok := staircaseByIP.Load(srcIP); ok {
 					st = v.(staircaseState)
 					if cfg.CleanupAfter > 0 && now.Sub(st.LastSeen) > cfg.CleanupAfter {
-						st.NextDelay = cfg.MinDelay
+						st.CurrentDelay = cfg.MinDelay
 					}
 				}
 
-				actualDelay = st.NextDelay
+				actualDelay = st.CurrentDelay
 
 				if cfg.DelayMax > 0 && actualDelay > cfg.DelayMax {
 					st.LastSeen = now
@@ -472,13 +472,13 @@ func main() {
 					return 0
 				}
 
-				st.NextDelay = actualDelay + cfg.DelayStep
+				st.CurrentDelay += cfg.DelayStep
 				st.LastSeen = now
 				staircaseByIP.Store(srcIP, st)
 
 				logVerbose(cfg.Verbose,
 					"STAIRCASE-DELAY ip=%s packet=%d delay=%s next_delay=%s delay_step=%s delay_max=%s",
-					srcIP, id, actualDelay, st.NextDelay, cfg.DelayStep, cfg.DelayMax,
+					srcIP, id, actualDelay, st.CurrentDelay, cfg.DelayStep, cfg.DelayMax,
 				)
 			}
 
