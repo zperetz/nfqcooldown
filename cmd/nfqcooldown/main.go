@@ -22,27 +22,28 @@ import (
 var Version = "dev"
 
 type Config struct {
-	QueueNum         uint
-	Action           string
-	Mode             string
-	Cooldown         time.Duration
-	MinDelay         time.Duration
-	MaxDelay         time.Duration
-	Jitter           time.Duration
-	Whitelist        string
-	Verbose          bool
-	Seed             int64
-	StatsEvery       time.Duration
-	CleanupAfter     time.Duration
-	CleanupEvery     time.Duration
-	ForgetOnDrop     bool
-	MaxDropsPerIP    int
-	RejectMark       int
-	Packet           string
-	MaxPendingDelays int
-	DelayStrategy    string
-	PaceInterval     time.Duration
-	MaxQueuedDelay   time.Duration
+	QueueNum          uint
+	Action            string
+	Mode              string
+	Cooldown          time.Duration
+	MinDelay          time.Duration
+	MaxDelay          time.Duration
+	Jitter            time.Duration
+	Whitelist         string
+	Verbose           bool
+	Seed              int64
+	StatsEvery        time.Duration
+	CleanupAfter      time.Duration
+	CleanupEvery      time.Duration
+	ForgetOnDrop      bool
+	MaxDropsPerIP     int
+	RejectMark        int
+	Packet            string
+	MaxPendingDelays  int
+	DelayStrategy     string
+	SingleDropRepeats int
+	PaceInterval      time.Duration
+	MaxQueuedDelay    time.Duration
 }
 
 func parseConfig() Config {
@@ -64,7 +65,8 @@ func parseConfig() Config {
 	rejectMarkStr := flag.String("reject-mark", "0", "packet mark for reject action, e.g. 0x44; 0 disables")
 	packet := flag.String("packet", "syn", "packet type to process: syn or synack")
 	maxPendingDelays := flag.Int("max-pending-delays", 0, "maximum pending delayed packets; 0 disables limit")
-	delayStrategy := flag.String("delay-strategy", "sleep", "delay strategy: sleep or pace")
+	delayStrategy := flag.String("delay-strategy", "sleep", "delay strategy: sleep, pace or single")
+	singleDropRepeats := flag.Int("single-drop-repeats", 0, "for single strategy: drop first N packets while delay is pending; 0 drops all")
 	paceIntervalStr := flag.String("pace-interval", "250ms", "interval between paced delayed packets")
 	maxQueuedDelayStr := flag.String("max-queued-delay", "0", "maximum queued delay for pace strategy; 0 disables")
 
@@ -110,28 +112,33 @@ func parseConfig() Config {
 		fatalf("bad delay-strategy %q: use sleep, pace or single", *delayStrategy)
 	}
 
+	if *singleDropRepeats < 0 {
+		fatalf("bad single-drop-repeats %d: must be >= 0", *singleDropRepeats)
+	}
+
 	return Config{
-		QueueNum:         *queueNum,
-		Packet:           *packet,
-		Action:           *action,
-		Mode:             *mode,
-		Cooldown:         cooldown,
-		MinDelay:         minDelay,
-		MaxDelay:         maxDelay,
-		Jitter:           jitter,
-		Whitelist:        *whitelist,
-		Verbose:          *verbose,
-		RejectMark:       int(rejectMark64),
-		Seed:             *seed,
-		StatsEvery:       statsEvery,
-		MaxDropsPerIP:    *maxDropsPerIP,
-		ForgetOnDrop:     *forgetOnDrop,
-		CleanupAfter:     cleanupAfter,
-		CleanupEvery:     cleanupEvery,
-		MaxPendingDelays: *maxPendingDelays,
-		DelayStrategy:    *delayStrategy,
-		PaceInterval:     paceInterval,
-		MaxQueuedDelay:   maxQueuedDelay,
+		QueueNum:          *queueNum,
+		Packet:            *packet,
+		Action:            *action,
+		Mode:              *mode,
+		Cooldown:          cooldown,
+		MinDelay:          minDelay,
+		MaxDelay:          maxDelay,
+		Jitter:            jitter,
+		Whitelist:         *whitelist,
+		Verbose:           *verbose,
+		RejectMark:        int(rejectMark64),
+		Seed:              *seed,
+		StatsEvery:        statsEvery,
+		MaxDropsPerIP:     *maxDropsPerIP,
+		ForgetOnDrop:      *forgetOnDrop,
+		CleanupAfter:      cleanupAfter,
+		CleanupEvery:      cleanupEvery,
+		MaxPendingDelays:  *maxPendingDelays,
+		DelayStrategy:     *delayStrategy,
+		SingleDropRepeats: *singleDropRepeats,
+		PaceInterval:      paceInterval,
+		MaxQueuedDelay:    maxQueuedDelay,
 	}
 }
 
@@ -176,6 +183,7 @@ STATE:
     --forget-on-drop            Forget source IP state after DROP/REJECT
     --max-drops-per-ip <n>      Force accept after N consecutive drops; 0 disables
     --reject-mark <mark>        packet mark for reject action, e.g. 0x44; 0 disables
+    --single-drop-repeats <n>   In single strategy, drop first N pending repeats; 0 drops all
 
 FILTERING:
     --whitelist <ip,cidr,...>   Comma-separated IP/CIDR whitelist
@@ -238,6 +246,7 @@ func main() {
 	var pendingDelays int64
 	var nextSendAtByIP sync.Map
 	var singlePendingByIP sync.Map
+	var singleDropCountByIP sync.Map
 	handler := func(a nfqueue.Attribute) int {
 		if a.PacketID == nil {
 			return 0
@@ -411,6 +420,33 @@ func main() {
 
 			if cfg.DelayStrategy == "single" {
 				if _, loaded := singlePendingByIP.LoadOrStore(srcIP, true); loaded {
+					dropCount := 0
+					if v, ok := singleDropCountByIP.Load(srcIP); ok {
+						dropCount = v.(int)
+					}
+
+					if cfg.SingleDropRepeats > 0 && dropCount >= cfg.SingleDropRepeats {
+						counters.IncAccepted()
+
+						state.RememberEvent(core.LastEvent{
+							Type:      "SINGLE-PENDING-ACCEPT",
+							IP:        srcIP,
+							PacketID:  id,
+							Cooldown:  cooldown,
+							Elapsed:   elapsed,
+							Remaining: remaining,
+						})
+
+						logVerbose(cfg.Verbose,
+							"SINGLE-PENDING-ACCEPT ip=%s packet=%d drops=%d limit=%d cooldown=%s elapsed=%s remaining=%s",
+							srcIP, id, dropCount, cfg.SingleDropRepeats, cooldown, elapsed, remaining,
+						)
+
+						_ = nf.SetVerdict(id, nfqueue.NfAccept)
+						return 0
+					}
+
+					singleDropCountByIP.Store(srcIP, dropCount+1)
 					counters.IncDelayOverflowDropped()
 
 					state.RememberEvent(core.LastEvent{
@@ -423,8 +459,8 @@ func main() {
 					})
 
 					logVerbose(cfg.Verbose,
-						"SINGLE-PENDING-DROP ip=%s packet=%d cooldown=%s elapsed=%s remaining=%s",
-						srcIP, id, cooldown, elapsed, remaining,
+						"SINGLE-PENDING-DROP ip=%s packet=%d drops=%d limit=%d cooldown=%s elapsed=%s remaining=%s",
+						srcIP, id, dropCount+1, cfg.SingleDropRepeats, cooldown, elapsed, remaining,
 					)
 
 					_ = nf.SetVerdict(id, nfqueue.NfDrop)
@@ -432,6 +468,7 @@ func main() {
 				}
 
 				releaseSingle = true
+				singleDropCountByIP.Store(srcIP, 0)
 			}
 
 			atomic.AddInt64(&pendingDelays, 1)
@@ -456,6 +493,7 @@ func main() {
 
 				if releaseSingle {
 					singlePendingByIP.Delete(ip)
+					singleDropCountByIP.Delete(ip)
 				}
 			}(id, srcIP, actualDelay, releaseSingle)
 			return 0
