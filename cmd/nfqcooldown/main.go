@@ -463,6 +463,13 @@ func main() {
 		}
 		allowed, cooldown, elapsed, remaining, _ := state.Decide(srcIP, now, id)
 		if allowed {
+			if cfg.DelayStrategy == "staircase" {
+				staircaseByIP.Store(srcIP, staircaseState{
+					CurrentDelay: cfg.MinDelay,
+					LastSeen:     now,
+				})
+			}
+
 			counters.IncAccepted()
 			logVerbose(cfg.Verbose, "ACCEPT ip=%s packet=%d elapsed=%s new_cooldown=%s", srcIP, id, elapsed, cooldown)
 			_ = nf.SetVerdict(id, nfqueue.NfAccept)
