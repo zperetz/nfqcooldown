@@ -46,6 +46,10 @@ type Config struct {
 	DelayMax          time.Duration
 	PaceInterval      time.Duration
 	MaxQueuedDelay    time.Duration
+	RetryAction       string
+	RetryWindow       time.Duration
+	RetryDelay        time.Duration
+	MaxRetryAccepts   int
 }
 
 func parseConfig() Config {
@@ -73,6 +77,10 @@ func parseConfig() Config {
 	delayMaxStr := flag.String("delay-max", "0", "for staircase strategy: maximum delay before dropping; 0 disables")
 	paceIntervalStr := flag.String("pace-interval", "250ms", "interval between paced delayed packets")
 	maxQueuedDelayStr := flag.String("max-queued-delay", "0", "maximum queued delay for pace strategy; 0 disables")
+	retryAction := flag.String("retry-action", "off", "SYN/ACK retry action: off, accept, delay or drop")
+	retryWindowStr := flag.String("retry-window", "2s", "time window for recognizing SYN/ACK retries")
+	retryDelayStr := flag.String("retry-delay", "50ms", "delay used when retry-action=delay")
+	maxRetryAccepts := flag.Int("max-retry-accepts", 1, "maximum rescued retries per handshake; 0 disables rescue")
 
 	flag.Usage = printUsage
 
@@ -100,6 +108,8 @@ func parseConfig() Config {
 	delayMax := mustDuration("delay-max", *delayMaxStr)
 	paceInterval := mustDuration("pace-interval", *paceIntervalStr)
 	maxQueuedDelay := mustDuration("max-queued-delay", *maxQueuedDelayStr)
+	retryWindow := mustDuration("retry-window", *retryWindowStr)
+	retryDelay := mustDuration("retry-delay", *retryDelayStr)
 
 	rejectMark64, err := strconv.ParseUint(*rejectMarkStr, 0, 32)
 	if err != nil {
@@ -124,6 +134,19 @@ func parseConfig() Config {
 
 	if *singleDropRepeats < 0 {
 		fatalf("bad single-drop-repeats %d: must be >= 0", *singleDropRepeats)
+	}
+
+	if *retryAction != "off" && *retryAction != "accept" && *retryAction != "delay" && *retryAction != "drop" {
+		fatalf("bad retry-action %q: use off, accept, delay or drop", *retryAction)
+	}
+	if retryWindow <= 0 {
+		fatalf("bad retry-window %q: must be > 0", *retryWindowStr)
+	}
+	if retryDelay < 0 {
+		fatalf("bad retry-delay %q: must be >= 0", *retryDelayStr)
+	}
+	if *maxRetryAccepts < 0 {
+		fatalf("bad max-retry-accepts %d: must be >= 0", *maxRetryAccepts)
 	}
 
 	return Config{
@@ -151,6 +174,10 @@ func parseConfig() Config {
 		DelayMax:          delayMax,
 		PaceInterval:      paceInterval,
 		MaxQueuedDelay:    maxQueuedDelay,
+		RetryAction:       *retryAction,
+		RetryWindow:       retryWindow,
+		RetryDelay:        retryDelay,
+		MaxRetryAccepts:   *maxRetryAccepts,
 	}
 }
 
@@ -198,6 +225,10 @@ STATE:
     --max-drops-per-ip <n>      Force accept after N consecutive drops; 0 disables
     --reject-mark <mark>        packet mark for reject action, e.g. 0x44; 0 disables
     --single-drop-repeats <n>   In single strategy, drop first N pending repeats; 0 drops all
+    --retry-action <mode>        SYN/ACK retry action: off | accept | delay | drop
+    --retry-window <duration>    Window for recognizing retries (default: 2s)
+    --retry-delay <duration>     Delay for retry-action=delay (default: 50ms)
+    --max-retry-accepts <n>      Maximum rescued retries per handshake (default: 1)
 
 FILTERING:
     --whitelist <ip,cidr,...>   Comma-separated IP/CIDR whitelist
@@ -225,6 +256,71 @@ EXAMPLES:
 `, Version)
 }
 
+type retryKey struct {
+	ClientIP   string
+	ClientPort uint16
+	ServerPort uint16
+	Seq        uint32
+	Ack        uint32
+}
+
+type retryEntry struct {
+	FirstSeen time.Time
+	LastSeen  time.Time
+	Rescued   int
+}
+
+type retryTracker struct {
+	mu      sync.Mutex
+	entries map[retryKey]retryEntry
+}
+
+func newRetryTracker() *retryTracker {
+	return &retryTracker{entries: make(map[retryKey]retryEntry)}
+}
+
+func (t *retryTracker) observe(key retryKey, now time.Time, window time.Duration) (isRetry bool, rescued int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	entry, ok := t.entries[key]
+	if !ok || now.Sub(entry.FirstSeen) > window {
+		t.entries[key] = retryEntry{FirstSeen: now, LastSeen: now}
+		return false, 0
+	}
+
+	entry.LastSeen = now
+	t.entries[key] = entry
+	return true, entry.Rescued
+}
+
+func (t *retryTracker) markRescued(key retryKey) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	entry, ok := t.entries[key]
+	if !ok {
+		return 0
+	}
+	entry.Rescued++
+	t.entries[key] = entry
+	return entry.Rescued
+}
+
+func (t *retryTracker) cleanup(now time.Time, ttl time.Duration) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	removed := 0
+	for key, entry := range t.entries {
+		if now.Sub(entry.LastSeen) > ttl {
+			delete(t.entries, key)
+			removed++
+		}
+	}
+	return removed
+}
+
 func main() {
 	cfg := parseConfig()
 	if cfg.Seed == 0 {
@@ -243,6 +339,7 @@ func main() {
 
 	state := core.NewState(algorithm)
 	counters := &core.Counters{}
+	retries := newRetryTracker()
 
 	nfqConfig := nfqueue.Config{NfQueue: uint16(cfg.QueueNum), MaxPacketLen: 0xffff, MaxQueueLen: 8192, Copymode: nfqueue.NfQnlCopyPacket, WriteTimeout: 15 * time.Millisecond}
 	nf, err := nfqueue.Open(&nfqConfig)
@@ -255,6 +352,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	go cleanupLoop(ctx, state, cfg.CleanupEvery, cfg.CleanupAfter)
+	go retryCleanupLoop(ctx, retries, cfg.CleanupEvery, cfg.RetryWindow)
 	go statsLoop(ctx, cfg, state, counters)
 
 	type staircaseState struct {
@@ -279,6 +377,7 @@ func main() {
 
 		var srcIP string
 		var matched bool
+		var synAckInfo core.PacketInfo
 
 		switch cfg.Packet {
 		case "syn":
@@ -287,6 +386,7 @@ func main() {
 		case "synack":
 			info, ok := core.ParseIPv4TCPSYNACK(*a.Payload)
 			if ok {
+				synAckInfo = info
 				srcIP = info.ClientIP
 				matched = true
 			}
@@ -307,6 +407,60 @@ func main() {
 		}
 
 		now := time.Now()
+
+		if cfg.Packet == "synack" && cfg.RetryAction != "off" {
+			key := retryKey{
+				ClientIP:   synAckInfo.ClientIP,
+				ClientPort: synAckInfo.ClientPort,
+				ServerPort: synAckInfo.ServerPort,
+				Seq:        synAckInfo.Seq,
+				Ack:        synAckInfo.Ack,
+			}
+
+			isRetry, rescued := retries.observe(key, now, cfg.RetryWindow)
+			if isRetry {
+				canRescue := cfg.MaxRetryAccepts > 0 && rescued < cfg.MaxRetryAccepts
+
+				switch {
+				case cfg.RetryAction == "accept" && canRescue:
+					rescueNumber := retries.markRescued(key)
+					counters.IncAccepted()
+					logVerbose(cfg.Verbose,
+						"RETRY-ACCEPT ip=%s client_port=%d server_port=%d seq=%d ack=%d packet=%d rescue=%d/%d",
+						srcIP, synAckInfo.ClientPort, synAckInfo.ServerPort, synAckInfo.Seq, synAckInfo.Ack,
+						id, rescueNumber, cfg.MaxRetryAccepts,
+					)
+					_ = nf.SetVerdict(id, nfqueue.NfAccept)
+					return 0
+
+				case cfg.RetryAction == "delay" && canRescue:
+					rescueNumber := retries.markRescued(key)
+					atomic.AddInt64(&pendingDelays, 1)
+					logVerbose(cfg.Verbose,
+						"RETRY-DELAY ip=%s client_port=%d server_port=%d seq=%d ack=%d packet=%d delay=%s rescue=%d/%d",
+						srcIP, synAckInfo.ClientPort, synAckInfo.ServerPort, synAckInfo.Seq, synAckInfo.Ack,
+						id, cfg.RetryDelay, rescueNumber, cfg.MaxRetryAccepts,
+					)
+					go func(packetID uint32, delay time.Duration) {
+						defer atomic.AddInt64(&pendingDelays, -1)
+						time.Sleep(delay)
+						counters.IncAccepted()
+						_ = nf.SetVerdict(packetID, nfqueue.NfAccept)
+					}(id, cfg.RetryDelay)
+					return 0
+
+				default:
+					counters.IncDropped()
+					logVerbose(cfg.Verbose,
+						"RETRY-DROP ip=%s client_port=%d server_port=%d seq=%d ack=%d packet=%d rescued=%d/%d action=%s",
+						srcIP, synAckInfo.ClientPort, synAckInfo.ServerPort, synAckInfo.Seq, synAckInfo.Ack,
+						id, rescued, cfg.MaxRetryAccepts, cfg.RetryAction,
+					)
+					_ = nf.SetVerdict(id, nfqueue.NfDrop)
+					return 0
+				}
+			}
+		}
 		allowed, cooldown, elapsed, remaining, _ := state.Decide(srcIP, now, id)
 		if allowed {
 			counters.IncAccepted()
@@ -576,6 +730,20 @@ func main() {
 		fatalf("register failed: %v", err)
 	}
 	<-ctx.Done()
+}
+
+func retryCleanupLoop(ctx context.Context, retries *retryTracker, every, ttl time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			retries.cleanup(now, ttl)
+		}
+	}
 }
 
 func cleanupLoop(ctx context.Context, state *core.State, every, ttl time.Duration) {
