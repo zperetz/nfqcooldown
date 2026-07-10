@@ -356,6 +356,7 @@ func main() {
 	go statsLoop(ctx, cfg, state, counters)
 
 	type staircaseState struct {
+		mu           sync.Mutex
 		CurrentDelay time.Duration
 		LastSeen     time.Time
 	}
@@ -464,10 +465,12 @@ func main() {
 		allowed, cooldown, elapsed, remaining, _ := state.Decide(srcIP, now, id)
 		if allowed {
 			if cfg.DelayStrategy == "staircase" {
-				staircaseByIP.Store(srcIP, staircaseState{
-					CurrentDelay: cfg.MinDelay,
-					LastSeen:     now,
-				})
+				v, _ := staircaseByIP.LoadOrStore(srcIP, &staircaseState{})
+				st := v.(*staircaseState)
+				st.mu.Lock()
+				st.CurrentDelay = cfg.MinDelay
+				st.LastSeen = now
+				st.mu.Unlock()
 			}
 
 			counters.IncAccepted()
@@ -599,20 +602,24 @@ func main() {
 
 			if cfg.DelayStrategy == "staircase" {
 				now := time.Now()
-				st := staircaseState{CurrentDelay: cfg.MinDelay, LastSeen: now}
+				v, _ := staircaseByIP.LoadOrStore(srcIP, &staircaseState{
+					CurrentDelay: cfg.MinDelay,
+					LastSeen:     now,
+				})
+				st := v.(*staircaseState)
 
-				if v, ok := staircaseByIP.Load(srcIP); ok {
-					st = v.(staircaseState)
-					if cfg.CleanupAfter > 0 && now.Sub(st.LastSeen) > cfg.CleanupAfter {
-						st.CurrentDelay = cfg.MinDelay
-					}
+				st.mu.Lock()
+				if st.CurrentDelay <= 0 {
+					st.CurrentDelay = cfg.MinDelay
 				}
-
+				if cfg.CleanupAfter > 0 && now.Sub(st.LastSeen) > cfg.CleanupAfter {
+					st.CurrentDelay = cfg.MinDelay
+				}
 				actualDelay = st.CurrentDelay
 
 				if cfg.DelayMax > 0 && actualDelay > cfg.DelayMax {
 					st.LastSeen = now
-					staircaseByIP.Store(srcIP, st)
+					st.mu.Unlock()
 					counters.IncDelayOverflowDropped()
 
 					state.RememberEvent(core.LastEvent{
@@ -633,13 +640,12 @@ func main() {
 					return 0
 				}
 
-				st.CurrentDelay += cfg.DelayStep
 				st.LastSeen = now
-				staircaseByIP.Store(srcIP, st)
+				st.mu.Unlock()
 
 				logVerbose(cfg.Verbose,
-					"STAIRCASE-DELAY ip=%s packet=%d delay=%s next_delay=%s delay_step=%s delay_max=%s",
-					srcIP, id, actualDelay, st.CurrentDelay, cfg.DelayStep, cfg.DelayMax,
+					"STAIRCASE-DELAY ip=%s packet=%d delay=%s delay_step=%s delay_max=%s",
+					srcIP, id, actualDelay, cfg.DelayStep, cfg.DelayMax,
 				)
 			}
 
@@ -707,6 +713,24 @@ func main() {
 				time.Sleep(delay)
 				cd, _ := state.MarkDelayedAccept(ip, time.Now(), packetID, delay)
 				counters.IncAccepted()
+
+				if cfg.DelayStrategy == "staircase" {
+					if v, ok := staircaseByIP.Load(ip); ok {
+						st := v.(*staircaseState)
+						st.mu.Lock()
+						if st.CurrentDelay == delay {
+							st.CurrentDelay += cfg.DelayStep
+						}
+						st.LastSeen = time.Now()
+						nextDelay := st.CurrentDelay
+						st.mu.Unlock()
+
+						logVerbose(cfg.Verbose,
+							"STAIRCASE-ADVANCE ip=%s packet=%d completed_delay=%s next_delay=%s delay_step=%s",
+							ip, packetID, delay, nextDelay, cfg.DelayStep,
+						)
+					}
+				}
 
 				logVerbose(cfg.Verbose,
 					"ACCEPT-AFTER-DELAY ip=%s packet=%d strategy=%s waited=%s new_cooldown=%s pending=%d",
