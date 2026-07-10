@@ -22,34 +22,35 @@ import (
 var Version = "dev"
 
 type Config struct {
-	QueueNum          uint
-	Action            string
-	Mode              string
-	Cooldown          time.Duration
-	MinDelay          time.Duration
-	MaxDelay          time.Duration
-	Jitter            time.Duration
-	Whitelist         string
-	Verbose           bool
-	Seed              int64
-	StatsEvery        time.Duration
-	CleanupAfter      time.Duration
-	CleanupEvery      time.Duration
-	ForgetOnDrop      bool
-	MaxDropsPerIP     int
-	RejectMark        int
-	Packet            string
-	MaxPendingDelays  int
-	DelayStrategy     string
-	SingleDropRepeats int
-	DelayStep         time.Duration
-	DelayMax          time.Duration
-	PaceInterval      time.Duration
-	MaxQueuedDelay    time.Duration
-	RetryAction       string
-	RetryWindow       time.Duration
-	RetryDelay        time.Duration
-	MaxRetryAccepts   int
+	QueueNum             uint
+	Action               string
+	Mode                 string
+	Cooldown             time.Duration
+	MinDelay             time.Duration
+	MaxDelay             time.Duration
+	Jitter               time.Duration
+	Whitelist            string
+	Verbose              bool
+	Seed                 int64
+	StatsEvery           time.Duration
+	CleanupAfter         time.Duration
+	CleanupEvery         time.Duration
+	ForgetOnDrop         bool
+	MaxDropsPerIP        int
+	RejectMark           int
+	Packet               string
+	MaxPendingDelays     int
+	DelayStrategy        string
+	SleepRandomPerPacket bool
+	SingleDropRepeats    int
+	DelayStep            time.Duration
+	DelayMax             time.Duration
+	PaceInterval         time.Duration
+	MaxQueuedDelay       time.Duration
+	RetryAction          string
+	RetryWindow          time.Duration
+	RetryDelay           time.Duration
+	MaxRetryAccepts      int
 }
 
 func parseConfig() Config {
@@ -72,6 +73,7 @@ func parseConfig() Config {
 	packet := flag.String("packet", "syn", "packet type to process: syn or synack")
 	maxPendingDelays := flag.Int("max-pending-delays", 0, "maximum pending delayed packets; 0 disables limit")
 	delayStrategy := flag.String("delay-strategy", "sleep", "delay strategy: sleep, pace, single or staircase")
+	sleepRandomPerPacket := flag.Bool("sleep-random-per-packet", false, "for sleep+random: choose an independent random delay for each delayed packet")
 	singleDropRepeats := flag.Int("single-drop-repeats", 0, "for single strategy: drop first N packets while delay is pending; 0 drops all")
 	delayStepStr := flag.String("delay-step", "50ms", "for staircase strategy: increase delay by this step after each packet")
 	delayMaxStr := flag.String("delay-max", "0", "for staircase strategy: maximum delay before dropping; 0 disables")
@@ -132,6 +134,10 @@ func parseConfig() Config {
 		fatalf("bad delay-step %q: must be > 0 for staircase strategy", *delayStepStr)
 	}
 
+	if *sleepRandomPerPacket && (*delayStrategy != "sleep" || *mode != "random") {
+		fatalf("--sleep-random-per-packet requires --delay-strategy sleep and --mode random")
+	}
+
 	if *singleDropRepeats < 0 {
 		fatalf("bad single-drop-repeats %d: must be >= 0", *singleDropRepeats)
 	}
@@ -150,34 +156,35 @@ func parseConfig() Config {
 	}
 
 	return Config{
-		QueueNum:          *queueNum,
-		Packet:            *packet,
-		Action:            *action,
-		Mode:              *mode,
-		Cooldown:          cooldown,
-		MinDelay:          minDelay,
-		MaxDelay:          maxDelay,
-		Jitter:            jitter,
-		Whitelist:         *whitelist,
-		Verbose:           *verbose,
-		RejectMark:        int(rejectMark64),
-		Seed:              *seed,
-		StatsEvery:        statsEvery,
-		MaxDropsPerIP:     *maxDropsPerIP,
-		ForgetOnDrop:      *forgetOnDrop,
-		CleanupAfter:      cleanupAfter,
-		CleanupEvery:      cleanupEvery,
-		MaxPendingDelays:  *maxPendingDelays,
-		DelayStrategy:     *delayStrategy,
-		SingleDropRepeats: *singleDropRepeats,
-		DelayStep:         delayStep,
-		DelayMax:          delayMax,
-		PaceInterval:      paceInterval,
-		MaxQueuedDelay:    maxQueuedDelay,
-		RetryAction:       *retryAction,
-		RetryWindow:       retryWindow,
-		RetryDelay:        retryDelay,
-		MaxRetryAccepts:   *maxRetryAccepts,
+		QueueNum:             *queueNum,
+		Packet:               *packet,
+		Action:               *action,
+		Mode:                 *mode,
+		Cooldown:             cooldown,
+		MinDelay:             minDelay,
+		MaxDelay:             maxDelay,
+		Jitter:               jitter,
+		Whitelist:            *whitelist,
+		Verbose:              *verbose,
+		RejectMark:           int(rejectMark64),
+		Seed:                 *seed,
+		StatsEvery:           statsEvery,
+		MaxDropsPerIP:        *maxDropsPerIP,
+		ForgetOnDrop:         *forgetOnDrop,
+		CleanupAfter:         cleanupAfter,
+		CleanupEvery:         cleanupEvery,
+		MaxPendingDelays:     *maxPendingDelays,
+		DelayStrategy:        *delayStrategy,
+		SleepRandomPerPacket: *sleepRandomPerPacket,
+		SingleDropRepeats:    *singleDropRepeats,
+		DelayStep:            delayStep,
+		DelayMax:             delayMax,
+		PaceInterval:         paceInterval,
+		MaxQueuedDelay:       maxQueuedDelay,
+		RetryAction:          *retryAction,
+		RetryWindow:          retryWindow,
+		RetryDelay:           retryDelay,
+		MaxRetryAccepts:      *maxRetryAccepts,
 	}
 }
 
@@ -187,6 +194,13 @@ func mustDuration(name, value string) time.Duration {
 		fatalf("bad %s %q: %v", name, value, err)
 	}
 	return d
+}
+
+func randomDuration(min, max time.Duration) time.Duration {
+	if max <= min {
+		return min
+	}
+	return min + time.Duration(rand.Int63n(int64(max-min)+1))
 }
 
 func fatalf(format string, args ...any) { fmt.Fprintf(os.Stderr, format+"\n", args...); os.Exit(1) }
@@ -217,6 +231,7 @@ TIMING:
     --jitter <duration>         Jitter around base cooldown (default: 100ms)
     --delay-step <duration>     Staircase step added after each packet (default: 50ms)
     --delay-max <duration>      Staircase maximum delay before DROP; 0 disables
+    --sleep-random-per-packet   With sleep+random, randomize every delayed packet independently
 
 STATE:
     --cleanup-every <duration>  Cleanup interval (default: 30s)
@@ -562,6 +577,14 @@ func main() {
 			counters.IncDelayed()
 
 			actualDelay := remaining
+
+			if cfg.DelayStrategy == "sleep" && cfg.SleepRandomPerPacket {
+				actualDelay = randomDuration(cfg.MinDelay, cfg.MaxDelay)
+				logVerbose(cfg.Verbose,
+					"SLEEP-RANDOM-DELAY ip=%s packet=%d delay=%s min=%s max=%s",
+					srcIP, id, actualDelay, cfg.MinDelay, cfg.MaxDelay,
+				)
+			}
 
 			if cfg.DelayStrategy == "pace" {
 				now := time.Now()
