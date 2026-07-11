@@ -51,6 +51,8 @@ type Config struct {
 	RetryWindow          time.Duration
 	RetryDelay           time.Duration
 	MaxRetryAccepts      int
+	BurstInterval        time.Duration
+	BurstMaxDelay        time.Duration
 }
 
 func parseConfig() Config {
@@ -83,6 +85,8 @@ func parseConfig() Config {
 	retryWindowStr := flag.String("retry-window", "2s", "time window for recognizing SYN/ACK retries")
 	retryDelayStr := flag.String("retry-delay", "50ms", "delay used when retry-action=delay")
 	maxRetryAccepts := flag.Int("max-retry-accepts", 1, "maximum rescued retries per handshake; 0 disables rescue")
+	burstIntervalStr := flag.String("burst-interval", "100ms", "minimum interval between released packets in shape mode")
+	burstMaxDelayStr := flag.String("burst-max-delay", "1s", "maximum queued delay in shape mode; packets beyond this limit are dropped")
 
 	flag.Usage = printUsage
 
@@ -112,14 +116,16 @@ func parseConfig() Config {
 	maxQueuedDelay := mustDuration("max-queued-delay", *maxQueuedDelayStr)
 	retryWindow := mustDuration("retry-window", *retryWindowStr)
 	retryDelay := mustDuration("retry-delay", *retryDelayStr)
+	burstInterval := mustDuration("burst-interval", *burstIntervalStr)
+	burstMaxDelay := mustDuration("burst-max-delay", *burstMaxDelayStr)
 
 	rejectMark64, err := strconv.ParseUint(*rejectMarkStr, 0, 32)
 	if err != nil {
 		fatalf("bad reject-mark %q: %v", *rejectMarkStr, err)
 	}
 
-	if *action != "drop" && *action != "delay" && *action != "reject" {
-		fatalf("bad action %q: use drop, delay or reject", *action)
+	if *action != "drop" && *action != "delay" && *action != "reject" && *action != "shape" {
+		fatalf("bad action %q: use drop, delay, reject or shape", *action)
 	}
 
 	if *packet != "syn" && *packet != "synack" {
@@ -154,6 +160,15 @@ func parseConfig() Config {
 	if *maxRetryAccepts < 0 {
 		fatalf("bad max-retry-accepts %d: must be >= 0", *maxRetryAccepts)
 	}
+	if *action == "shape" && *packet != "syn" {
+		fatalf("--action shape requires --packet syn")
+	}
+	if burstInterval <= 0 {
+		fatalf("bad burst-interval %q: must be > 0", *burstIntervalStr)
+	}
+	if burstMaxDelay < 0 {
+		fatalf("bad burst-max-delay %q: must be >= 0", *burstMaxDelayStr)
+	}
 
 	return Config{
 		QueueNum:             *queueNum,
@@ -185,6 +200,8 @@ func parseConfig() Config {
 		RetryWindow:          retryWindow,
 		RetryDelay:           retryDelay,
 		MaxRetryAccepts:      *maxRetryAccepts,
+		BurstInterval:        burstInterval,
+		BurstMaxDelay:        burstMaxDelay,
 	}
 }
 
@@ -220,7 +237,7 @@ USAGE:
 
 CORE OPTIONS:
     --queue <n>                 NFQUEUE number (default: 443)
-    --action <mode>             Action inside cooldown: drop | delay | reject (default: drop)
+    --action <mode>             Action: drop | delay | reject | shape (default: drop)
     --mode <algorithm>          Cooldown algorithm: fixed | random | jitter (default: fixed)
     --packet <syn|synack>       Packet type to process (default: syn)
 
@@ -232,6 +249,8 @@ TIMING:
     --delay-step <duration>     Staircase step added after each packet (default: 50ms)
     --delay-max <duration>      Staircase maximum delay before DROP; 0 disables
     --sleep-random-per-packet   With sleep+random, randomize every delayed packet independently
+    --burst-interval <duration> Minimum interval between released packets in shape mode (default: 100ms)
+    --burst-max-delay <duration> Maximum queued delay in shape mode; 0 disables (default: 1s)
 
 STATE:
     --cleanup-every <duration>  Cleanup interval (default: 30s)
@@ -336,6 +355,11 @@ func (t *retryTracker) cleanup(now time.Time, ttl time.Duration) int {
 	return removed
 }
 
+type burstPacerState struct {
+	mu          sync.Mutex
+	NextRelease time.Time
+}
+
 func main() {
 	cfg := parseConfig()
 	if cfg.Seed == 0 {
@@ -381,6 +405,7 @@ func main() {
 	var singlePendingByIP sync.Map
 	var singleDropCountByIP sync.Map
 	var staircaseByIP sync.Map
+	var burstPacerByIP sync.Map
 	handler := func(a nfqueue.Attribute) int {
 		if a.PacketID == nil {
 			return 0
@@ -477,6 +502,89 @@ func main() {
 				}
 			}
 		}
+		if cfg.Action == "shape" {
+			v, _ := burstPacerByIP.LoadOrStore(srcIP, &burstPacerState{})
+			pacer := v.(*burstPacerState)
+
+			pacer.mu.Lock()
+			if pacer.NextRelease.IsZero() || !pacer.NextRelease.After(now) {
+				pacer.NextRelease = now.Add(cfg.BurstInterval)
+				nextRelease := pacer.NextRelease
+				pacer.mu.Unlock()
+
+				counters.IncAccepted()
+				state.RememberEvent(core.LastEvent{Type: "SHAPE-ACCEPT", IP: srcIP, PacketID: id})
+				logVerbose(cfg.Verbose,
+					"SHAPE-ACCEPT ip=%s packet=%d next_release_in=%s interval=%s",
+					srcIP, id, time.Until(nextRelease), cfg.BurstInterval,
+				)
+				_ = nf.SetVerdict(id, nfqueue.NfAccept)
+				return 0
+			}
+
+			sendAt := pacer.NextRelease
+			actualDelay := time.Until(sendAt)
+			if actualDelay < 0 {
+				actualDelay = 0
+			}
+
+			if cfg.BurstMaxDelay > 0 && actualDelay > cfg.BurstMaxDelay {
+				pacer.mu.Unlock()
+				counters.IncDelayOverflowDropped()
+				state.RememberEvent(core.LastEvent{
+					Type:      "SHAPE-OVERFLOW-DROP",
+					IP:        srcIP,
+					PacketID:  id,
+					Remaining: actualDelay,
+				})
+				logVerbose(cfg.Verbose,
+					"SHAPE-OVERFLOW-DROP ip=%s packet=%d queued_delay=%s max_delay=%s",
+					srcIP, id, actualDelay, cfg.BurstMaxDelay,
+				)
+				_ = nf.SetVerdict(id, nfqueue.NfDrop)
+				return 0
+			}
+
+			pacer.NextRelease = sendAt.Add(cfg.BurstInterval)
+			nextRelease := pacer.NextRelease
+			pacer.mu.Unlock()
+
+			if cfg.MaxPendingDelays > 0 && atomic.LoadInt64(&pendingDelays) >= int64(cfg.MaxPendingDelays) {
+				counters.IncDelayOverflowDropped()
+				logVerbose(cfg.Verbose,
+					"SHAPE-PENDING-DROP ip=%s packet=%d pending=%d limit=%d",
+					srcIP, id, atomic.LoadInt64(&pendingDelays), cfg.MaxPendingDelays,
+				)
+				_ = nf.SetVerdict(id, nfqueue.NfDrop)
+				return 0
+			}
+
+			counters.IncDelayed()
+			atomic.AddInt64(&pendingDelays, 1)
+			state.RememberEvent(core.LastEvent{
+				Type:      "SHAPE-DELAY",
+				IP:        srcIP,
+				PacketID:  id,
+				Remaining: actualDelay,
+			})
+			logVerbose(cfg.Verbose,
+				"SHAPE-DELAY ip=%s packet=%d delay=%s next_release_in=%s interval=%s pending=%d",
+				srcIP, id, actualDelay, time.Until(nextRelease), cfg.BurstInterval, atomic.LoadInt64(&pendingDelays),
+			)
+
+			go func(packetID uint32, ip string, delay time.Duration) {
+				defer atomic.AddInt64(&pendingDelays, -1)
+				time.Sleep(delay)
+				counters.IncAccepted()
+				logVerbose(cfg.Verbose,
+					"SHAPE-RELEASE ip=%s packet=%d waited=%s pending=%d",
+					ip, packetID, delay, atomic.LoadInt64(&pendingDelays),
+				)
+				_ = nf.SetVerdict(packetID, nfqueue.NfAccept)
+			}(id, srcIP, actualDelay)
+			return 0
+		}
+
 		allowed, cooldown, elapsed, remaining, _ := state.Decide(srcIP, now, id)
 		if allowed {
 			if cfg.DelayStrategy == "staircase" {
