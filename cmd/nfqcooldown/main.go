@@ -355,9 +355,17 @@ func (t *retryTracker) cleanup(now time.Time, ttl time.Duration) int {
 	return removed
 }
 
+type shapeFlowKey struct {
+	ClientIP   string
+	ClientPort uint16
+	ServerPort uint16
+	Seq        uint32
+}
+
 type burstPacerState struct {
 	mu          sync.Mutex
-	NextRelease time.Time
+	LastRelease time.Time
+	Pending     bool
 }
 
 func main() {
@@ -406,6 +414,7 @@ func main() {
 	var singleDropCountByIP sync.Map
 	var staircaseByIP sync.Map
 	var burstPacerByIP sync.Map
+	var shapePendingFlows sync.Map
 	handler := func(a nfqueue.Attribute) int {
 		if a.PacketID == nil {
 			return 0
@@ -418,11 +427,17 @@ func main() {
 
 		var srcIP string
 		var matched bool
+		var synInfo core.PacketInfo
 		var synAckInfo core.PacketInfo
 
 		switch cfg.Packet {
 		case "syn":
-			srcIP, matched = core.ParseIPv4PureTCPSYN(*a.Payload)
+			info, ok := core.ParseIPv4PureTCPSYNInfo(*a.Payload)
+			if ok {
+				synInfo = info
+				srcIP = info.ClientIP
+				matched = true
+			}
 
 		case "synack":
 			info, ok := core.ParseIPv4TCPSYNACK(*a.Payload)
@@ -503,27 +518,31 @@ func main() {
 			}
 		}
 		if cfg.Action == "shape" {
+			flowKey := shapeFlowKey{ClientIP: synInfo.ClientIP, ClientPort: synInfo.ClientPort, ServerPort: synInfo.ServerPort, Seq: synInfo.Seq}
+
+			if _, pending := shapePendingFlows.Load(flowKey); pending {
+				counters.IncDelayOverflowDropped()
+				logVerbose(cfg.Verbose, "SHAPE-FLOW-PENDING-DROP ip=%s client_port=%d server_port=%d seq=%d packet=%d", srcIP, synInfo.ClientPort, synInfo.ServerPort, synInfo.Seq, id)
+				_ = nf.SetVerdict(id, nfqueue.NfDrop)
+				return 0
+			}
+
 			v, _ := burstPacerByIP.LoadOrStore(srcIP, &burstPacerState{})
 			pacer := v.(*burstPacerState)
-
 			pacer.mu.Lock()
-			if pacer.NextRelease.IsZero() || !pacer.NextRelease.After(now) {
-				pacer.NextRelease = now.Add(cfg.BurstInterval)
-				nextRelease := pacer.NextRelease
-				pacer.mu.Unlock()
 
+			if pacer.LastRelease.IsZero() || now.Sub(pacer.LastRelease) >= cfg.BurstInterval {
+				pacer.LastRelease = now
+				pacer.Pending = false
+				pacer.mu.Unlock()
 				counters.IncAccepted()
 				state.RememberEvent(core.LastEvent{Type: "SHAPE-ACCEPT", IP: srcIP, PacketID: id})
-				logVerbose(cfg.Verbose,
-					"SHAPE-ACCEPT ip=%s packet=%d next_release_in=%s interval=%s",
-					srcIP, id, time.Until(nextRelease), cfg.BurstInterval,
-				)
+				logVerbose(cfg.Verbose, "SHAPE-ACCEPT ip=%s client_port=%d server_port=%d seq=%d packet=%d next_release_in=%s interval=%s", srcIP, synInfo.ClientPort, synInfo.ServerPort, synInfo.Seq, id, cfg.BurstInterval, cfg.BurstInterval)
 				_ = nf.SetVerdict(id, nfqueue.NfAccept)
 				return 0
 			}
 
-			sendAt := pacer.NextRelease
-			actualDelay := time.Until(sendAt)
+			actualDelay := cfg.BurstInterval - now.Sub(pacer.LastRelease)
 			if actualDelay < 0 {
 				actualDelay = 0
 			}
@@ -531,57 +550,46 @@ func main() {
 			if cfg.BurstMaxDelay > 0 && actualDelay > cfg.BurstMaxDelay {
 				pacer.mu.Unlock()
 				counters.IncDelayOverflowDropped()
-				state.RememberEvent(core.LastEvent{
-					Type:      "SHAPE-OVERFLOW-DROP",
-					IP:        srcIP,
-					PacketID:  id,
-					Remaining: actualDelay,
-				})
-				logVerbose(cfg.Verbose,
-					"SHAPE-OVERFLOW-DROP ip=%s packet=%d queued_delay=%s max_delay=%s",
-					srcIP, id, actualDelay, cfg.BurstMaxDelay,
-				)
+				logVerbose(cfg.Verbose, "SHAPE-OVERFLOW-DROP ip=%s client_port=%d server_port=%d seq=%d packet=%d delay=%s max_delay=%s", srcIP, synInfo.ClientPort, synInfo.ServerPort, synInfo.Seq, id, actualDelay, cfg.BurstMaxDelay)
 				_ = nf.SetVerdict(id, nfqueue.NfDrop)
 				return 0
 			}
 
-			pacer.NextRelease = sendAt.Add(cfg.BurstInterval)
-			nextRelease := pacer.NextRelease
-			pacer.mu.Unlock()
+			if pacer.Pending {
+				pacer.mu.Unlock()
+				counters.IncDelayOverflowDropped()
+				logVerbose(cfg.Verbose, "SHAPE-IP-PENDING-DROP ip=%s client_port=%d server_port=%d seq=%d packet=%d delay=%s", srcIP, synInfo.ClientPort, synInfo.ServerPort, synInfo.Seq, id, actualDelay)
+				_ = nf.SetVerdict(id, nfqueue.NfDrop)
+				return 0
+			}
 
 			if cfg.MaxPendingDelays > 0 && atomic.LoadInt64(&pendingDelays) >= int64(cfg.MaxPendingDelays) {
+				pacer.mu.Unlock()
 				counters.IncDelayOverflowDropped()
-				logVerbose(cfg.Verbose,
-					"SHAPE-PENDING-DROP ip=%s packet=%d pending=%d limit=%d",
-					srcIP, id, atomic.LoadInt64(&pendingDelays), cfg.MaxPendingDelays,
-				)
+				logVerbose(cfg.Verbose, "SHAPE-PENDING-DROP ip=%s client_port=%d server_port=%d seq=%d packet=%d pending=%d limit=%d", srcIP, synInfo.ClientPort, synInfo.ServerPort, synInfo.Seq, id, atomic.LoadInt64(&pendingDelays), cfg.MaxPendingDelays)
 				_ = nf.SetVerdict(id, nfqueue.NfDrop)
 				return 0
 			}
 
+			pacer.Pending = true
+			pacer.mu.Unlock()
+			shapePendingFlows.Store(flowKey, true)
 			counters.IncDelayed()
 			atomic.AddInt64(&pendingDelays, 1)
-			state.RememberEvent(core.LastEvent{
-				Type:      "SHAPE-DELAY",
-				IP:        srcIP,
-				PacketID:  id,
-				Remaining: actualDelay,
-			})
-			logVerbose(cfg.Verbose,
-				"SHAPE-DELAY ip=%s packet=%d delay=%s next_release_in=%s interval=%s pending=%d",
-				srcIP, id, actualDelay, time.Until(nextRelease), cfg.BurstInterval, atomic.LoadInt64(&pendingDelays),
-			)
+			logVerbose(cfg.Verbose, "SHAPE-DELAY ip=%s client_port=%d server_port=%d seq=%d packet=%d delay=%s interval=%s pending=%d", srcIP, synInfo.ClientPort, synInfo.ServerPort, synInfo.Seq, id, actualDelay, cfg.BurstInterval, atomic.LoadInt64(&pendingDelays))
 
-			go func(packetID uint32, ip string, delay time.Duration) {
+			go func(packetID uint32, ip string, key shapeFlowKey, delay time.Duration, pacer *burstPacerState) {
 				defer atomic.AddInt64(&pendingDelays, -1)
 				time.Sleep(delay)
+				pacer.mu.Lock()
+				pacer.LastRelease = time.Now()
+				pacer.Pending = false
+				pacer.mu.Unlock()
+				shapePendingFlows.Delete(key)
 				counters.IncAccepted()
-				logVerbose(cfg.Verbose,
-					"SHAPE-RELEASE ip=%s packet=%d waited=%s pending=%d",
-					ip, packetID, delay, atomic.LoadInt64(&pendingDelays),
-				)
+				logVerbose(cfg.Verbose, "SHAPE-RELEASE ip=%s client_port=%d server_port=%d seq=%d packet=%d waited=%s pending=%d", ip, key.ClientPort, key.ServerPort, key.Seq, packetID, delay, atomic.LoadInt64(&pendingDelays))
 				_ = nf.SetVerdict(packetID, nfqueue.NfAccept)
-			}(id, srcIP, actualDelay)
+			}(id, srcIP, flowKey, actualDelay, pacer)
 			return 0
 		}
 
