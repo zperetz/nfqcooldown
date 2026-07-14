@@ -222,6 +222,7 @@ type shapeFlowKey struct {
 type burstPacerState struct {
 	mu          sync.Mutex
 	LastRelease time.Time
+	LastSeen    time.Time
 	Pending     bool
 }
 
@@ -261,12 +262,13 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	go cleanupLoop(ctx, state, cfg.CleanupEvery, cfg.CleanupAfter)
-	go statsLoop(ctx, cfg, state, counters)
-
 	var pendingDelays int64
 	var burstPacerByIP sync.Map
 	var shapePendingFlows sync.Map
+
+	go cleanupLoop(ctx, state, cfg.CleanupEvery, cfg.CleanupAfter)
+	go shapeCleanupLoop(ctx, &burstPacerByIP, cfg.CleanupEvery, cfg.CleanupAfter)
+	go statsLoop(ctx, cfg, state, counters)
 
 	handler := func(a nfqueue.Attribute) int {
 		if a.PacketID == nil {
@@ -351,9 +353,11 @@ func main() {
 			pacer := v.(*burstPacerState)
 
 			pacer.mu.Lock()
+			pacer.LastSeen = now
 
 			if pacer.LastRelease.IsZero() || now.Sub(pacer.LastRelease) >= cfg.BurstInterval {
 				pacer.LastRelease = now
+				pacer.LastSeen = now
 				pacer.Pending = false
 				pacer.mu.Unlock()
 
@@ -489,7 +493,9 @@ func main() {
 				time.Sleep(delay)
 
 				pacer.mu.Lock()
-				pacer.LastRelease = time.Now()
+				releasedAt := time.Now()
+				pacer.LastRelease = releasedAt
+				pacer.LastSeen = releasedAt
 				pacer.Pending = false
 				pacer.mu.Unlock()
 				shapePendingFlows.Delete(key)
@@ -730,6 +736,51 @@ func printStats(
 				ev.Elapsed,
 				ev.Remaining,
 			)
+		}
+	}
+}
+
+func shapeCleanupLoop(
+	ctx context.Context,
+	burstPacerByIP *sync.Map,
+	every time.Duration,
+	ttl time.Duration,
+) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+
+		case now := <-t.C:
+			removed := 0
+
+			burstPacerByIP.Range(func(key, value any) bool {
+				pacer := value.(*burstPacerState)
+
+				pacer.mu.Lock()
+				stale := !pacer.Pending &&
+					!pacer.LastSeen.IsZero() &&
+					now.Sub(pacer.LastSeen) > ttl
+				pacer.mu.Unlock()
+
+				if stale {
+					burstPacerByIP.Delete(key)
+					removed++
+				}
+
+				return true
+			})
+
+			if removed > 0 {
+				fmt.Printf(
+					"[nfqcooldown] shape cleanup removed=%d ttl=%s\n",
+					removed,
+					ttl,
+				)
+			}
 		}
 	}
 }
