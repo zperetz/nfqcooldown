@@ -239,7 +239,6 @@ ARGS="
   --max-pending-delays 2
   --cleanup-every 4s
   --cleanup-after 15s
-  --verbose
 "
 ```
 
