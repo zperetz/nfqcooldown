@@ -1,9 +1,9 @@
 # nfqcooldown
 [![Build](https://github.com/zperetz/nfqcooldown/actions/workflows/build.yml/badge.svg)](https://github.com/zperetz/nfqcooldown/actions/workflows/build.yml)
 
-**nfqcooldown** is an experimental NFQUEUE-based TCP SYN pacing daemon for Linux.
+**nfqcooldown** is an NFQUEUE-based IPv4 TCP SYN rate-limiting and shaping daemon for Linux.
 
-It allows userspace logic to decide what to do with incoming TCP SYN packets: accept them, drop them, or delay them according to configurable cooldown algorithms.
+It applies configurable rate-limiting and shaping policies to incoming TCP SYN packets.
 
 The project is intended for experiments with TCP connection pacing, firewall behavior, packet filtering strategies, and client connection patterns.
 
@@ -13,21 +13,18 @@ nfqcooldown receives selected packets from the Linux kernel through Netfilter NF
 
 For each incoming TCP SYN packet, it tracks the source IP address and applies a cooldown policy. If a client tries to open a new TCP connection too soon, nfqcooldown can:
 
-* drop the SYN packet;
-* delay the SYN packet and accept it later;
-* mark it as rejected in logs.
+* temporarily delay a SYN packet to smooth bursts of new connections
+* drop the SYN packet
 
 This makes it possible to implement packet handling logic that is difficult or impossible to express with standard iptables modules such as `recent`, `hashlimit`, or `connlimit`.
 
 ## Features
 
-* Per-source-IP TCP SYN cooldown
+* Per-source-IP TCP SYN rate limiting and shaping
 * NFQUEUE-based userspace packet decisions
-* Fixed cooldown mode
-* Random cooldown mode
-* Jitter cooldown mode
-* Drop mode
-* Delay mode
+* DROP: Fixed cooldown mode
+* DROP: Random cooldown mode
+* DROP: Jitter cooldown mode
 * IP/CIDR whitelist
 * Verbose per-packet logging
 * Periodic aggregate statistics
@@ -55,27 +52,27 @@ nfqcooldown daemon
         |
         +--> ACCEPT
         +--> DROP
-        +--> DELAY, then ACCEPT
+        +--> SHAPE
 ```
 
 Example iptables rule:
 
 ```bash
-sudo iptables -I INPUT 1 -i eth0 -p tcp --dport 443 \
-  -m tcp --tcp-flags SYN SYN \
+sudo iptables -t mangle -I INPUT 1 -i eth0 -p tcp --dport 443 \
+  -m tcp --tcp-flags SYN,RST,ACK SYN \
   -j NFQUEUE --queue-num 443 --queue-bypass
 ```
 
 The `--queue-bypass` option is recommended. If the daemon is stopped or crashes, packets continue through the normal firewall path instead of being blocked.
 
-Make sure your normal ACCEPT rule remains below it:
+If you use the default filter INPUT chain, make sure the normal ACCEPT rule remains below the NFQUEUE rule:
 
 ```bash
 sudo iptables -A INPUT -i eth0 -p tcp --dport 443 -j ACCEPT
 ```
 
 
-## Installation
+## Build from source
 
 Build the binary:
 
@@ -97,25 +94,30 @@ sudo make install
 
 ## Quick start
 
-Run nfqcooldown with a fixed 500 ms cooldown:
-
-```bash
-sudo /usr/local/sbin/nfqcooldown \
-  --queue 443 \
-  --action drop \
-  --mode fixed \
-  --cooldown 500ms
-```
-
 Add an iptables NFQUEUE rule:
 
 ```bash
 sudo iptables -I INPUT 1 -i eth0 -p tcp --dport 443 \
-  -m tcp --tcp-flags SYN SYN \
+  -m tcp --tcp-flags SYN,RST,ACK SYN \
   -j NFQUEUE --queue-num 443 --queue-bypass
 ```
 
-## Usage examples
+Start nfqcooldown:
+
+### Shaping
+
+```bash
+sudo nfqcooldown \
+  --queue 443 \
+  --packet syn \
+  --action shape \
+  --burst-interval 1000ms \
+  --burst-max-delay 50ms \
+  --max-pending-delays 2
+```
+
+
+Other usage examples:
 
 ### Fixed cooldown
 
@@ -155,19 +157,6 @@ sudo nfqcooldown \
   --jitter 100ms
 ```
 
-### Delay instead of drop
-
-Delay packets that arrive inside the cooldown window:
-
-```bash
-sudo nfqcooldown \
-  --queue 443 \
-  --action delay \
-  --mode random \
-  --min-delay 300ms \
-  --max-delay 450ms
-```
-
 ### Whitelist trusted IPs
 
 ```bash
@@ -184,10 +173,8 @@ sudo nfqcooldown \
 ```bash
 sudo nfqcooldown \
   --queue 443 \
-  --action delay \
-  --mode random \
-  --min-delay 300ms \
-  --max-delay 450ms \
+  --packet syn \
+  --action shape \
   --verbose
 ```
 
@@ -195,24 +182,27 @@ Verbose mode logs individual packet decisions.
 
 ## Command-line options
 
-| Option               | Description                                            |
-| -------------------- | ------------------------------------------------------ |
-| `--queue`            | NFQUEUE number                                         |
-| `--action`           | Action inside cooldown: `drop`, `delay`, or `reject`   |
-| `--mode`             | Cooldown algorithm: `fixed`, `random`, or `jitter`     |
-| `--cooldown`         | Base cooldown duration                                 |
-| `--min-delay`        | Minimum delay for random mode                          |
-| `--max-delay`        | Maximum delay for random mode                          |
-| `--jitter`           | Jitter range around base cooldown                      |
-| `--whitelist`        | Comma-separated list of trusted IPs or CIDRs           |
-| `--verbose`          | Enable per-packet decision logging                     |
-| `--seed`             | Random seed for reproducible experiments               |
-| `--stats-every`      | Aggregate statistics interval                          |
-| `--cleanup-every`    | Remove inactive IPs from memory every `duration`       |
-| `--cleanup-after`    | Remove inactive IPs from memory after `duration`       |
-| `--forget-on-drop`   | Remove IP in case of DROP action                       |
-| `--max-drops-per-ip` | Force accept after N consecutive drops from same IP    |
-| `--reject-mark`      | [EXPERIMENTAL] Reject mark to use in iptables REJECT   |
+| Option                  | Description                                            |
+| ----------------------- | ------------------------------------------------------ |
+| `--queue`               | NFQUEUE number                                         |
+| `--packet`              | Packet type; synack is intended for diagnostics        |
+| `--action`              | Action inside cooldown: `drop` or `shape`              |
+| `--mode`                | Cooldown algorithm: `fixed`, `random`, or `jitter`     |
+| `--cooldown`            | Base cooldown duration for fixed or jitter mode        |
+| `--min-delay`           | Minimum delay for random mode                          |
+| `--max-delay`           | Maximum delay for random mode                          |
+| `--jitter`              | Jitter range around base cooldown                      |
+| `--whitelist`           | Comma-separated list of trusted IPs or CIDRs  (IPv4)   |
+| `--verbose`             | Enable per-packet decision logging                     |
+| `--seed`                | Random seed for reproducible experiments               |
+| `--stats-every`         | Aggregate statistics interval                          |
+| `--cleanup-every`       | Remove inactive IPs from memory every `duration`       |
+| `--cleanup-after`       | Remove inactive IPs from memory after `duration`       |
+| `--forget-on-drop`      | Remove IP in case of DROP action                       |
+| `--max-drops-per-ip`    | Force accept after N consecutive drops from same IP    |
+| `--burst-interval`      | Min interval between released SYN packets for shape    |
+| `--burst-max-delay`     | Maximum permitted delay for shape                      |
+| `--max-pending-delays`  | Global pending shaped-packet limit                     |
 
 
 ## systemd service
@@ -227,8 +217,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=/etc/default/nfqcooldown
-ExecStart=/usr/local/sbin/nfqcooldown --queue ${QUEUE} --action ${ACTION} --mode ${MODE} --cooldown ${COOLDOWN} --min-delay ${MIN_DELAY} --max-delay ${MAX_DELAY} --jitter ${JITTER} --whitelist ${WHITELIST} --verbose=${VERBOSE}  --cleanup-every=${CLEANUP_EVERY} --cleanup-after=${CLEANUP_AFTER} --max-drops-per-ip ${MAX_DROPS}
+EnvironmentFile=/etc/default/nfqcooldown.cfg
+ExecStart=/usr/local/sbin/nfqcooldown $ARGS
 
 Restart=always
 RestartSec=2
@@ -237,21 +227,20 @@ RestartSec=2
 WantedBy=multi-user.target
 ```
 
-Example (best practice, but ymmv)`/etc/default/nfqcooldown`:
+Example (best practice, but ymmv)`/etc/default/nfqcooldown.cfg`:
 
 ```bash
-QUEUE=443
-ACTION=reject
-MODE=random
-COOLDOWN=500ms
-JITTER=150ms
-MIN_DELAY=950ms
-MAX_DELAY=1090ms
-WHITELIST=
-VERBOSE=false
-CLEANUP_EVERY=30s
-CLEANUP_AFTER=2m
-MAX_DROPS=10
+ARGS="
+  --queue 443
+  --packet syn
+  --action shape
+  --burst-interval 1050ms
+  --burst-max-delay 50ms
+  --max-pending-delays 2
+  --cleanup-every 4s
+  --cleanup-after 15s
+  --verbose
+"
 ```
 
 Enable service:
@@ -272,22 +261,21 @@ journalctl -u nfqcooldown -f
 Normal mode prints aggregate statistics:
 
 ```text
-[nfqcooldown] accepted=51 delayed=16 dropped=0 rejected=0 tracked_ips=9 action=delay mode=random cooldown=500ms min=300ms max=450ms jitter=150ms last=ACCEPT ip=1.2.3.4 actual_cooldown=419ms elapsed=0s remaining=0s
+[nfqcooldown] accepted=51 delayed=7 dropped=3 tracked_ips=4 action=shape packet=syn burst_interval=1s burst_max_delay=50ms max_pending_delays=2 last=SHAPE-RELEASE ip=1.2.3.4 packet_id=51 remaining=0s
 ```
 
 Verbose mode prints every packet decision:
 
 ```text
-[nfqcooldown] ACCEPT ip=1.2.3.4 packet=123 elapsed=512ms new_cooldown=437ms
-[nfqcooldown] DELAY ip=1.2.3.4 packet=124 cooldown=437ms elapsed=120ms remaining=317ms
-[nfqcooldown] ACCEPT-AFTER-DELAY ip=1.2.3.4 packet=124 waited=317ms new_cooldown=421ms
+[nfqcooldown] SHAPE-ACCEPT ip=1.2.3.4 packet=15
+[nfqcooldown] SHAPE-DELAY ip=1.2.3.4 packet=16 delay=42ms pending=1
+[nfqcooldown] SHAPE-RELEASE ip=1.2.3.4 packet=16
 ```
 
 ## Current limitations
 
-* IPv4 TCP SYN parsing only
-* `reject` mode is currently logged separately but uses a DROP verdict internally
-* Per-source-IP tracking only
+* IPv4 only (IPv6 is not supported)
+* TCP SYN and SYN/ACK packet parsing
 
 ## License
 
