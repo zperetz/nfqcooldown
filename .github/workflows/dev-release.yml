@@ -3,6 +3,7 @@ name: Development Release
 on:
   push:
     branches: [ dev ]
+    workflow_dispatch:
 
 permissions:
   contents: write
@@ -10,20 +11,6 @@ permissions:
 jobs:
   dev-release:
     runs-on: ubuntu-latest
-
-    defaults:
-      run:
-        working-directory: ./nfqcooldown
-
-    strategy:
-      matrix:
-        include:
-          - goos: linux
-            goarch: amd64
-            name: nfqcooldown-linux-amd64
-          - goos: linux
-            goarch: arm64
-            name: nfqcooldown-linux-arm64
 
     steps:
       - name: Checkout
@@ -33,29 +20,42 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: "1.25"
+          cache-dependency-path: nfqcooldown/go.sum
 
       - name: Download dependencies
         run: go mod download
 
-      - name: Build
+      - name: Build binaries
         run: |
           mkdir -p dist
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
-            go build -o dist/${{ matrix.name }} ./cmd/nfqcooldown
 
-      - name: Package
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
+            go build -ldflags="-X main.Version=dev-latest" -o dist/nfqcooldown-linux-amd64 ./cmd/nfqcooldown
+
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 \
+            go build -ldflags="-X main.Version=dev-latest" -o dist/nfqcooldown-linux-arm64 ./cmd/nfqcooldown
+
+      - name: Package binaries
         run: |
           cd dist
-          tar -czf ${{ matrix.name }}.tar.gz ${{ matrix.name }}
+          tar -czf nfqcooldown-linux-amd64.tar.gz nfqcooldown-linux-amd64
+          tar -czf nfqcooldown-linux-arm64.tar.gz nfqcooldown-linux-arm64
 
       - name: Delete old dev release
         continue-on-error: true
         run: |
-          gh release delete dev-latest --yes --cleanup-tag
+          gh release delete dev-latest --yes
         env:
           GH_TOKEN: ${{ github.token }}
 
-      - name: Upload dev release asset
+      - name: Create or update dev-latest tag
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git tag -f dev-latest
+          git push -f origin dev-latest
+
+      - name: Upload dev release assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: dev-latest
@@ -66,4 +66,6 @@ jobs:
             This release is intended for testing only.
           prerelease: true
           make_latest: false
-          files: nfqcooldown/dist/${{ matrix.name }}.tar.gz
+          files: |
+            dist/nfqcooldown-linux-amd64.tar.gz
+            dist/nfqcooldown-linux-arm64.tar.gz
