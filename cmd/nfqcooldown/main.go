@@ -7,6 +7,8 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -40,6 +42,10 @@ type Config struct {
 	MaxPendingDelays int
 	BurstInterval    time.Duration
 	BurstMaxDelay    time.Duration
+	SkipMarkEnabled  bool
+	SkipMarkValue    uint32
+	SkipMarkMask     uint32
+	SkipMarkSpec     string
 }
 
 func parseConfig() Config {
@@ -62,6 +68,7 @@ func parseConfig() Config {
 	maxPendingDelays := flag.Int("max-pending-delays", 0, "maximum pending shaped packets globally; 0 disables")
 	burstIntervalStr := flag.String("burst-interval", "100ms", "minimum interval between released SYN packets per IP in shape mode")
 	burstMaxDelayStr := flag.String("burst-max-delay", "1s", "maximum permitted delay in shape mode; packets beyond this limit are dropped")
+	skipMarkStr := flag.String("skip-mark", "", "accept packets matching mark or mark/mask, for example 0x400 or 0x400/0x400")
 
 	flag.Usage = printUsage
 
@@ -87,6 +94,7 @@ func parseConfig() Config {
 	cleanupEvery := mustDuration("cleanup-every", *cleanupEveryStr)
 	burstInterval := mustDuration("burst-interval", *burstIntervalStr)
 	burstMaxDelay := mustDuration("burst-max-delay", *burstMaxDelayStr)
+	skipMarkEnabled, skipMarkValue, skipMarkMask := mustMarkSpec("skip-mark", *skipMarkStr)
 
 	if *action != "drop" && *action != "shape" {
 		fatalf("bad action %q: use drop or shape", *action)
@@ -133,6 +141,10 @@ func parseConfig() Config {
 		MaxPendingDelays: *maxPendingDelays,
 		BurstInterval:    burstInterval,
 		BurstMaxDelay:    burstMaxDelay,
+		SkipMarkEnabled:  skipMarkEnabled,
+		SkipMarkValue:    skipMarkValue,
+		SkipMarkMask:     skipMarkMask,
+		SkipMarkSpec:     strings.TrimSpace(*skipMarkStr),
 	}
 }
 
@@ -144,6 +156,39 @@ func mustDuration(name, value string) time.Duration {
 	return d
 }
 
+func mustMarkSpec(name, value string) (bool, uint32, uint32) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false, 0, 0
+	}
+
+	parts := strings.Split(value, "/")
+	if len(parts) > 2 || parts[0] == "" {
+		fatalf("bad %s %q: use mark or mark/mask", name, value)
+	}
+
+	mark, err := strconv.ParseUint(parts[0], 0, 32)
+	if err != nil {
+		fatalf("bad %s %q: invalid mark", name, value)
+	}
+
+	mask := uint64(0xffffffff)
+	if len(parts) == 2 {
+		if parts[1] == "" {
+			fatalf("bad %s %q: empty mask", name, value)
+		}
+		mask, err = strconv.ParseUint(parts[1], 0, 32)
+		if err != nil {
+			fatalf("bad %s %q: invalid mask", name, value)
+		}
+		if mask == 0 {
+			fatalf("bad %s %q: mask must not be zero", name, value)
+		}
+	}
+
+	return true, uint32(mark), uint32(mask)
+}
+
 func fatalf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 	os.Exit(1)
@@ -153,6 +198,13 @@ func logVerbose(enabled bool, format string, args ...any) {
 	if enabled {
 		fmt.Printf("[nfqcooldown] "+format+"\n", args...)
 	}
+}
+
+func formatSkipMark(cfg Config) string {
+	if !cfg.SkipMarkEnabled {
+		return "disabled"
+	}
+	return fmt.Sprintf("0x%x/0x%x", cfg.SkipMarkValue, cfg.SkipMarkMask)
 }
 
 func printUsage() {
@@ -188,6 +240,7 @@ STATE:
 
 FILTERING:
     --whitelist <ip,cidr,...>     Comma-separated IP/CIDR whitelist
+    --skip-mark <mark[/mask]>     Accept matching packet marks before shaping/drop
 
 LOGGING:
     --stats-every <duration>      Aggregate stats interval (default: 30s)
@@ -208,6 +261,10 @@ EXAMPLES:
 
     nfqcooldown --queue 444 --packet synack --action drop \
       --mode fixed --cooldown 1s --verbose
+
+    nfqcooldown --queue 443 --packet syn --action shape \
+      --skip-mark 0x400/0x400 \
+      --burst-interval 1090ms --burst-max-delay 10ms
 
 `, Version)
 }
@@ -303,6 +360,27 @@ func main() {
 		}
 
 		if !matched {
+			_ = nf.SetVerdict(id, nfqueue.NfAccept)
+			return 0
+		}
+
+		if cfg.SkipMarkEnabled && a.Mark != nil &&
+			(*a.Mark&cfg.SkipMarkMask) == (cfg.SkipMarkValue&cfg.SkipMarkMask) {
+			state.RememberEvent(core.LastEvent{
+				Type:     "ACCEPT-SKIP-MARK",
+				IP:       srcIP,
+				PacketID: id,
+			})
+			counters.IncAccepted()
+			logVerbose(
+				cfg.Verbose,
+				"ACCEPT-SKIP-MARK ip=%s packet=%d packet_mark=0x%x skip_mark=0x%x/0x%x",
+				srcIP,
+				id,
+				*a.Mark,
+				cfg.SkipMarkValue,
+				cfg.SkipMarkMask,
+			)
 			_ = nf.SetVerdict(id, nfqueue.NfAccept)
 			return 0
 		}
@@ -591,7 +669,7 @@ func printStartupConfig(cfg Config, whitelistCount int) {
 	switch cfg.Action {
 	case "shape":
 		fmt.Printf(
-			"[nfqcooldown] started queue=%d action=shape packet=%s burst_interval=%s burst_max_delay=%s max_pending_delays=%d cleanup_every=%s cleanup_after=%s whitelist=%d verbose=%v seed=%d\n",
+			"[nfqcooldown] started queue=%d action=shape packet=%s burst_interval=%s burst_max_delay=%s max_pending_delays=%d cleanup_every=%s cleanup_after=%s whitelist=%d skip_mark=%s verbose=%v seed=%d\n",
 			cfg.QueueNum,
 			cfg.Packet,
 			cfg.BurstInterval,
@@ -600,6 +678,7 @@ func printStartupConfig(cfg Config, whitelistCount int) {
 			cfg.CleanupEvery,
 			cfg.CleanupAfter,
 			whitelistCount,
+			formatSkipMark(cfg),
 			cfg.Verbose,
 			cfg.Seed,
 		)
@@ -608,7 +687,7 @@ func printStartupConfig(cfg Config, whitelistCount int) {
 		switch cfg.Mode {
 		case "random":
 			fmt.Printf(
-				"[nfqcooldown] started queue=%d action=drop packet=%s mode=random min=%s max=%s max_drops_per_ip=%d forget_on_drop=%v cleanup_every=%s cleanup_after=%s whitelist=%d verbose=%v seed=%d\n",
+				"[nfqcooldown] started queue=%d action=drop packet=%s mode=random min=%s max=%s max_drops_per_ip=%d forget_on_drop=%v cleanup_every=%s cleanup_after=%s whitelist=%d skip_mark=%s verbose=%v seed=%d\n",
 				cfg.QueueNum,
 				cfg.Packet,
 				cfg.MinDelay,
@@ -618,13 +697,14 @@ func printStartupConfig(cfg Config, whitelistCount int) {
 				cfg.CleanupEvery,
 				cfg.CleanupAfter,
 				whitelistCount,
+				formatSkipMark(cfg),
 				cfg.Verbose,
 				cfg.Seed,
 			)
 
 		case "jitter":
 			fmt.Printf(
-				"[nfqcooldown] started queue=%d action=drop packet=%s mode=jitter cooldown=%s jitter=%s max_drops_per_ip=%d forget_on_drop=%v cleanup_every=%s cleanup_after=%s whitelist=%d verbose=%v seed=%d\n",
+				"[nfqcooldown] started queue=%d action=drop packet=%s mode=jitter cooldown=%s jitter=%s max_drops_per_ip=%d forget_on_drop=%v cleanup_every=%s cleanup_after=%s whitelist=%d skip_mark=%s verbose=%v seed=%d\n",
 				cfg.QueueNum,
 				cfg.Packet,
 				cfg.Cooldown,
@@ -634,13 +714,14 @@ func printStartupConfig(cfg Config, whitelistCount int) {
 				cfg.CleanupEvery,
 				cfg.CleanupAfter,
 				whitelistCount,
+				formatSkipMark(cfg),
 				cfg.Verbose,
 				cfg.Seed,
 			)
 
 		default:
 			fmt.Printf(
-				"[nfqcooldown] started queue=%d action=drop packet=%s mode=fixed cooldown=%s max_drops_per_ip=%d forget_on_drop=%v cleanup_every=%s cleanup_after=%s whitelist=%d verbose=%v seed=%d\n",
+				"[nfqcooldown] started queue=%d action=drop packet=%s mode=fixed cooldown=%s max_drops_per_ip=%d forget_on_drop=%v cleanup_every=%s cleanup_after=%s whitelist=%d skip_mark=%s verbose=%v seed=%d\n",
 				cfg.QueueNum,
 				cfg.Packet,
 				cfg.Cooldown,
@@ -649,6 +730,7 @@ func printStartupConfig(cfg Config, whitelistCount int) {
 				cfg.CleanupEvery,
 				cfg.CleanupAfter,
 				whitelistCount,
+				formatSkipMark(cfg),
 				cfg.Verbose,
 				cfg.Seed,
 			)
