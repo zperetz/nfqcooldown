@@ -111,9 +111,10 @@ sudo nfqcooldown \
   --queue 443 \
   --packet syn \
   --action shape \
-  --burst-interval 1000ms \
+  --burst-interval 1050ms \
   --burst-max-delay 50ms \
-  --max-pending-delays 2
+  --max-pending-delays 2 \
+  --skip-mark 0x400
 ```
 
 
@@ -203,7 +204,7 @@ Verbose mode logs individual packet decisions.
 | `--burst-interval`      | Min interval between released SYN packets for shape    |
 | `--burst-max-delay`     | Maximum permitted delay for shape                      |
 | `--max-pending-delays`  | Global pending shaped-packet limit                     |
-
+| `--skip-mark`           | Accept matching packet marks before shaping/drop       |
 
 ## systemd service
 
@@ -236,9 +237,11 @@ ARGS="
   --action shape
   --burst-interval 1050ms
   --burst-max-delay 50ms
+  --skip-mark 0x400
   --max-pending-delays 2
   --cleanup-every 4s
   --cleanup-after 15s
+  --skip-mark 0x400
 "
 ```
 
