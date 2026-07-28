@@ -23,29 +23,32 @@ import (
 var Version = "dev"
 
 type Config struct {
-	QueueNum         uint
-	Action           string
-	Mode             string
-	Cooldown         time.Duration
-	MinDelay         time.Duration
-	MaxDelay         time.Duration
-	Jitter           time.Duration
-	Whitelist        string
-	Verbose          bool
-	Seed             int64
-	StatsEvery       time.Duration
-	CleanupAfter     time.Duration
-	CleanupEvery     time.Duration
-	ForgetOnDrop     bool
-	MaxDropsPerIP    int
-	Packet           string
-	MaxPendingDelays int
-	BurstInterval    time.Duration
-	BurstMaxDelay    time.Duration
-	SkipMarkEnabled  bool
-	SkipMarkValue    uint32
-	SkipMarkMask     uint32
-	SkipMarkSpec     string
+	QueueNum          uint
+	Action            string
+	Mode              string
+	Cooldown          time.Duration
+	MinDelay          time.Duration
+	MaxDelay          time.Duration
+	Jitter            time.Duration
+	Whitelist         string
+	Verbose           bool
+	Seed              int64
+	StatsEvery        time.Duration
+	CleanupAfter      time.Duration
+	CleanupEvery      time.Duration
+	ForgetOnDrop      bool
+	MaxDropsPerIP     int
+	Packet            string
+	MaxPendingDelays  int
+	BurstInterval     time.Duration
+	BurstMaxDelay     time.Duration
+	SkipMarkEnabled   bool
+	SkipMarkValue     uint32
+	SkipMarkMask      uint32
+	SkipMarkSpec      string
+	RejectMarkEnabled bool
+	RejectMarkValue   uint32
+	RejectMarkSpec    string
 }
 
 func parseConfig() Config {
@@ -69,6 +72,7 @@ func parseConfig() Config {
 	burstIntervalStr := flag.String("burst-interval", "100ms", "minimum interval between released SYN packets per IP in shape mode")
 	burstMaxDelayStr := flag.String("burst-max-delay", "1s", "maximum permitted delay in shape mode; packets beyond this limit are dropped")
 	skipMarkStr := flag.String("skip-mark", "", "accept packets matching mark or mark/mask, for example 0x400 or 0x400/0x400")
+	rejectMarkStr := flag.String("reject-mark", "", "instead of dropping a packet, accept it with this mark set; nftables can reject it afterwards")
 
 	flag.Usage = printUsage
 
@@ -95,6 +99,7 @@ func parseConfig() Config {
 	burstInterval := mustDuration("burst-interval", *burstIntervalStr)
 	burstMaxDelay := mustDuration("burst-max-delay", *burstMaxDelayStr)
 	skipMarkEnabled, skipMarkValue, skipMarkMask := mustMarkSpec("skip-mark", *skipMarkStr)
+	rejectMarkEnabled, rejectMarkValue := mustMark("reject-mark", *rejectMarkStr)
 
 	if *action != "drop" && *action != "shape" {
 		fatalf("bad action %q: use drop or shape", *action)
@@ -122,29 +127,32 @@ func parseConfig() Config {
 	}
 
 	return Config{
-		QueueNum:         *queueNum,
-		Action:           *action,
-		Mode:             *mode,
-		Cooldown:         cooldown,
-		MinDelay:         minDelay,
-		MaxDelay:         maxDelay,
-		Jitter:           jitter,
-		Whitelist:        *whitelist,
-		Verbose:          *verbose,
-		Seed:             *seed,
-		StatsEvery:       statsEvery,
-		CleanupAfter:     cleanupAfter,
-		CleanupEvery:     cleanupEvery,
-		ForgetOnDrop:     *forgetOnDrop,
-		MaxDropsPerIP:    *maxDropsPerIP,
-		Packet:           *packet,
-		MaxPendingDelays: *maxPendingDelays,
-		BurstInterval:    burstInterval,
-		BurstMaxDelay:    burstMaxDelay,
-		SkipMarkEnabled:  skipMarkEnabled,
-		SkipMarkValue:    skipMarkValue,
-		SkipMarkMask:     skipMarkMask,
-		SkipMarkSpec:     strings.TrimSpace(*skipMarkStr),
+		QueueNum:          *queueNum,
+		Action:            *action,
+		Mode:              *mode,
+		Cooldown:          cooldown,
+		MinDelay:          minDelay,
+		MaxDelay:          maxDelay,
+		Jitter:            jitter,
+		Whitelist:         *whitelist,
+		Verbose:           *verbose,
+		Seed:              *seed,
+		StatsEvery:        statsEvery,
+		CleanupAfter:      cleanupAfter,
+		CleanupEvery:      cleanupEvery,
+		ForgetOnDrop:      *forgetOnDrop,
+		MaxDropsPerIP:     *maxDropsPerIP,
+		Packet:            *packet,
+		MaxPendingDelays:  *maxPendingDelays,
+		BurstInterval:     burstInterval,
+		BurstMaxDelay:     burstMaxDelay,
+		SkipMarkEnabled:   skipMarkEnabled,
+		SkipMarkValue:     skipMarkValue,
+		SkipMarkMask:      skipMarkMask,
+		SkipMarkSpec:      strings.TrimSpace(*skipMarkStr),
+		RejectMarkEnabled: rejectMarkEnabled,
+		RejectMarkValue:   rejectMarkValue,
+		RejectMarkSpec:    strings.TrimSpace(*rejectMarkStr),
 	}
 }
 
@@ -189,6 +197,23 @@ func mustMarkSpec(name, value string) (bool, uint32, uint32) {
 	return true, uint32(mark), uint32(mask)
 }
 
+func mustMark(name, value string) (bool, uint32) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false, 0
+	}
+
+	mark, err := strconv.ParseUint(value, 0, 32)
+	if err != nil {
+		fatalf("bad %s %q: invalid mark", name, value)
+	}
+	if mark == 0 {
+		fatalf("bad %s %q: mark must not be zero", name, value)
+	}
+
+	return true, uint32(mark)
+}
+
 func fatalf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 	os.Exit(1)
@@ -205,6 +230,13 @@ func formatSkipMark(cfg Config) string {
 		return "disabled"
 	}
 	return fmt.Sprintf("0x%x/0x%x", cfg.SkipMarkValue, cfg.SkipMarkMask)
+}
+
+func formatRejectMark(cfg Config) string {
+	if !cfg.RejectMarkEnabled {
+		return "disabled"
+	}
+	return fmt.Sprintf("0x%x", cfg.RejectMarkValue)
 }
 
 func printUsage() {
@@ -241,6 +273,7 @@ STATE:
 FILTERING:
     --whitelist <ip,cidr,...>     Comma-separated IP/CIDR whitelist
     --skip-mark <mark[/mask]>     Accept matching packet marks before shaping/drop
+    --reject-mark <mark>          Replace DROP with ACCEPT carrying old_mark|mark
 
 LOGGING:
     --stats-every <duration>      Aggregate stats interval (default: 30s)
@@ -264,6 +297,7 @@ EXAMPLES:
 
     nfqcooldown --queue 443 --packet syn --action shape \
       --skip-mark 0x400/0x400 \
+      --reject-mark 0x800 \
       --burst-interval 1090ms --burst-max-delay 10ms
 
 `, Version)
@@ -315,6 +349,19 @@ func main() {
 	}
 	defer nf.Close()
 	_ = nf.SetOption(netlink.NoENOBUFS, true)
+
+	dropOrReject := func(id uint32, packetMark *uint32) {
+		if !cfg.RejectMarkEnabled {
+			_ = nf.SetVerdict(id, nfqueue.NfDrop)
+			return
+		}
+
+		mark := cfg.RejectMarkValue
+		if packetMark != nil {
+			mark |= *packetMark
+		}
+		_ = nf.SetVerdictWithMark(id, nfqueue.NfAccept, int(mark))
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -423,7 +470,7 @@ func main() {
 					synInfo.Seq,
 					id,
 				)
-				_ = nf.SetVerdict(id, nfqueue.NfDrop)
+				dropOrReject(id, a.Mark)
 				return 0
 			}
 
@@ -486,7 +533,7 @@ func main() {
 					actualDelay,
 					cfg.BurstMaxDelay,
 				)
-				_ = nf.SetVerdict(id, nfqueue.NfDrop)
+				dropOrReject(id, a.Mark)
 				return 0
 			}
 
@@ -510,7 +557,7 @@ func main() {
 					id,
 					actualDelay,
 				)
-				_ = nf.SetVerdict(id, nfqueue.NfDrop)
+				dropOrReject(id, a.Mark)
 				return 0
 			}
 
@@ -530,7 +577,7 @@ func main() {
 					atomic.LoadInt64(&pendingDelays),
 					cfg.MaxPendingDelays,
 				)
-				_ = nf.SetVerdict(id, nfqueue.NfDrop)
+				dropOrReject(id, a.Mark)
 				return 0
 			}
 
@@ -648,7 +695,7 @@ func main() {
 			elapsed,
 			remaining,
 		)
-		_ = nf.SetVerdict(id, nfqueue.NfDrop)
+		dropOrReject(id, a.Mark)
 		return 0
 	}
 
@@ -669,7 +716,7 @@ func printStartupConfig(cfg Config, whitelistCount int) {
 	switch cfg.Action {
 	case "shape":
 		fmt.Printf(
-			"[nfqcooldown] started queue=%d action=shape packet=%s burst_interval=%s burst_max_delay=%s max_pending_delays=%d cleanup_every=%s cleanup_after=%s whitelist=%d skip_mark=%s verbose=%v seed=%d\n",
+			"[nfqcooldown] started queue=%d action=shape packet=%s burst_interval=%s burst_max_delay=%s max_pending_delays=%d cleanup_every=%s cleanup_after=%s whitelist=%d skip_mark=%s reject_mark=%s verbose=%v seed=%d\n",
 			cfg.QueueNum,
 			cfg.Packet,
 			cfg.BurstInterval,
@@ -679,6 +726,7 @@ func printStartupConfig(cfg Config, whitelistCount int) {
 			cfg.CleanupAfter,
 			whitelistCount,
 			formatSkipMark(cfg),
+			formatRejectMark(cfg),
 			cfg.Verbose,
 			cfg.Seed,
 		)
@@ -687,7 +735,7 @@ func printStartupConfig(cfg Config, whitelistCount int) {
 		switch cfg.Mode {
 		case "random":
 			fmt.Printf(
-				"[nfqcooldown] started queue=%d action=drop packet=%s mode=random min=%s max=%s max_drops_per_ip=%d forget_on_drop=%v cleanup_every=%s cleanup_after=%s whitelist=%d skip_mark=%s verbose=%v seed=%d\n",
+				"[nfqcooldown] started queue=%d action=drop packet=%s mode=random min=%s max=%s max_drops_per_ip=%d forget_on_drop=%v cleanup_every=%s cleanup_after=%s whitelist=%d skip_mark=%s reject_mark=%s verbose=%v seed=%d\n",
 				cfg.QueueNum,
 				cfg.Packet,
 				cfg.MinDelay,
@@ -698,13 +746,14 @@ func printStartupConfig(cfg Config, whitelistCount int) {
 				cfg.CleanupAfter,
 				whitelistCount,
 				formatSkipMark(cfg),
+				formatRejectMark(cfg),
 				cfg.Verbose,
 				cfg.Seed,
 			)
 
 		case "jitter":
 			fmt.Printf(
-				"[nfqcooldown] started queue=%d action=drop packet=%s mode=jitter cooldown=%s jitter=%s max_drops_per_ip=%d forget_on_drop=%v cleanup_every=%s cleanup_after=%s whitelist=%d skip_mark=%s verbose=%v seed=%d\n",
+				"[nfqcooldown] started queue=%d action=drop packet=%s mode=jitter cooldown=%s jitter=%s max_drops_per_ip=%d forget_on_drop=%v cleanup_every=%s cleanup_after=%s whitelist=%d skip_mark=%s reject_mark=%s verbose=%v seed=%d\n",
 				cfg.QueueNum,
 				cfg.Packet,
 				cfg.Cooldown,
@@ -715,13 +764,14 @@ func printStartupConfig(cfg Config, whitelistCount int) {
 				cfg.CleanupAfter,
 				whitelistCount,
 				formatSkipMark(cfg),
+				formatRejectMark(cfg),
 				cfg.Verbose,
 				cfg.Seed,
 			)
 
 		default:
 			fmt.Printf(
-				"[nfqcooldown] started queue=%d action=drop packet=%s mode=fixed cooldown=%s max_drops_per_ip=%d forget_on_drop=%v cleanup_every=%s cleanup_after=%s whitelist=%d skip_mark=%s verbose=%v seed=%d\n",
+				"[nfqcooldown] started queue=%d action=drop packet=%s mode=fixed cooldown=%s max_drops_per_ip=%d forget_on_drop=%v cleanup_every=%s cleanup_after=%s whitelist=%d skip_mark=%s reject_mark=%s verbose=%v seed=%d\n",
 				cfg.QueueNum,
 				cfg.Packet,
 				cfg.Cooldown,
@@ -731,6 +781,7 @@ func printStartupConfig(cfg Config, whitelistCount int) {
 				cfg.CleanupAfter,
 				whitelistCount,
 				formatSkipMark(cfg),
+				formatRejectMark(cfg),
 				cfg.Verbose,
 				cfg.Seed,
 			)
