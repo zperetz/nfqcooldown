@@ -288,9 +288,9 @@ Verbose mode logs individual packet decisions.
 | `--skip-mark`           | Accept matching packet marks before shaping/drop       |
 | `--reject-mark`         | Mark packet for icmp-reject instead of drop (nftables) |
 
-## systemd service
+## Install as systemd service
 
-Example service file ```/etc/systemd/system/nfqcooldown.service```:
+Service file ```/etc/systemd/system/nfqcooldown.service```:
 
 ```ini
 [Unit]
