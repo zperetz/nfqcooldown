@@ -49,6 +49,11 @@ type Config struct {
 	RejectMarkEnabled bool
 	RejectMarkValue   uint32
 	RejectMarkSpec    string
+	SplitAt           int
+	SplitMarkEnabled  bool
+	SplitMarkValue    uint32
+	SplitMarkSpec     string
+	SplitDelay        time.Duration
 }
 
 func parseConfig() Config {
@@ -73,6 +78,9 @@ func parseConfig() Config {
 	burstMaxDelayStr := flag.String("burst-max-delay", "1s", "maximum permitted delay in shape mode; packets beyond this limit are dropped")
 	skipMarkStr := flag.String("skip-mark", "", "accept packets matching mark or mark/mask, for example 0x400 or 0x400/0x400")
 	rejectMarkStr := flag.String("reject-mark", "", "instead of dropping a packet, accept it with this mark set; nftables can reject it afterwards")
+	splitAt := flag.Int("split-at", 1, "payload byte offset for split action")
+	splitMarkStr := flag.String("split-mark", "0x1000", "packet mark set on split segments; nftables should persist it to ct mark")
+	splitDelayStr := flag.String("split-delay", "1ms", "delay before sending the second split segment")
 
 	flag.Usage = printUsage
 
@@ -100,18 +108,35 @@ func parseConfig() Config {
 	burstMaxDelay := mustDuration("burst-max-delay", *burstMaxDelayStr)
 	skipMarkEnabled, skipMarkValue, skipMarkMask := mustMarkSpec("skip-mark", *skipMarkStr)
 	rejectMarkEnabled, rejectMarkValue := mustMark("reject-mark", *rejectMarkStr)
+	splitMarkEnabled, splitMarkValue := mustMark("split-mark", *splitMarkStr)
+	splitDelay := mustDuration("split-delay", *splitDelayStr)
 
-	if *action != "drop" && *action != "shape" {
-		fatalf("bad action %q: use drop or shape", *action)
+	if *action != "drop" && *action != "shape" && *action != "split" {
+		fatalf("bad action %q: use drop, shape or split", *action)
 	}
 	if *mode != "fixed" && *mode != "random" && *mode != "jitter" {
 		fatalf("bad mode %q: use fixed, random or jitter", *mode)
 	}
-	if *packet != "syn" && *packet != "synack" {
-		fatalf("bad packet %q: use syn or synack", *packet)
+	if *packet != "syn" && *packet != "synack" && *packet != "payload" {
+		fatalf("bad packet %q: use syn, synack or payload", *packet)
 	}
 	if *action == "shape" && *packet != "syn" {
 		fatalf("--action shape requires --packet syn")
+	}
+	if *action == "split" && *packet != "payload" {
+		fatalf("--action split requires --packet payload")
+	}
+	if *packet == "payload" && *action != "split" {
+		fatalf("--packet payload currently requires --action split")
+	}
+	if *action == "split" && !splitMarkEnabled {
+		fatalf("--action split requires a non-zero --split-mark")
+	}
+	if *splitAt <= 0 {
+		fatalf("bad split-at %d: must be > 0", *splitAt)
+	}
+	if splitDelay < 0 {
+		fatalf("bad split-delay %q: must be >= 0", *splitDelayStr)
 	}
 	if *maxDropsPerIP < 0 {
 		fatalf("bad max-drops-per-ip %d: must be >= 0", *maxDropsPerIP)
@@ -153,6 +178,11 @@ func parseConfig() Config {
 		RejectMarkEnabled: rejectMarkEnabled,
 		RejectMarkValue:   rejectMarkValue,
 		RejectMarkSpec:    strings.TrimSpace(*rejectMarkStr),
+		SplitAt:           *splitAt,
+		SplitMarkEnabled:  splitMarkEnabled,
+		SplitMarkValue:    splitMarkValue,
+		SplitMarkSpec:     strings.TrimSpace(*splitMarkStr),
+		SplitDelay:        splitDelay,
 	}
 }
 
@@ -242,15 +272,15 @@ func formatRejectMark(cfg Config) string {
 func printUsage() {
 	fmt.Fprintf(os.Stderr, `nfqcooldown %s
 
-NFQUEUE-based TCP SYN rate limiter.
+NFQUEUE-based TCP SYN rate limiter and TCP payload splitter.
 
 USAGE:
     nfqcooldown [OPTIONS]
 
 CORE OPTIONS:
     --queue <n>                   NFQUEUE number (default: 443)
-    --action <drop|shape>         Packet action (default: drop)
-    --packet <syn|synack>         Packet type; synack is intended for diagnostics
+    --action <drop|shape|split>   Packet action (default: drop)
+    --packet <syn|synack|payload> Packet type; payload is used by split
     --mode <fixed|random|jitter>  Cooldown algorithm used by drop (default: fixed)
 
 DROP MODE:
@@ -260,6 +290,11 @@ DROP MODE:
     --jitter <duration>           Jitter around cooldown (default: 100ms)
     --max-drops-per-ip <n>        Force accept after N consecutive drops; 0 disables
     --forget-on-drop              Forget source IP state after DROP
+
+SPLIT MODE:
+    --split-at <n>                Split payload before byte n (default: 1)
+    --split-mark <mark>           Packet mark for nftables persistence (default: 0x1000)
+    --split-delay <duration>      Delay before second segment (default: 1ms)
 
 SHAPE MODE:
     --burst-interval <duration>   Minimum interval between released SYN packets per IP
@@ -350,6 +385,15 @@ func main() {
 	defer nf.Close()
 	_ = nf.SetOption(netlink.NoENOBUFS, true)
 
+	var rawSender *core.RawIPv4Sender
+	if cfg.Action == "split" {
+		rawSender, err = core.NewRawIPv4Sender()
+		if err != nil {
+			fatalf("could not open raw IPv4 sender: %v", err)
+		}
+		defer rawSender.Close()
+	}
+
 	dropOrReject := func(id uint32, packetMark *uint32) {
 		if !cfg.RejectMarkEnabled {
 			_ = nf.SetVerdict(id, nfqueue.NfDrop)
@@ -382,6 +426,45 @@ func main() {
 
 		if a.Payload == nil {
 			_ = nf.SetVerdict(id, nfqueue.NfAccept)
+			return 0
+		}
+
+		if cfg.Packet == "payload" {
+			info, ok := core.ParseIPv4TCPPayload(*a.Payload)
+			if !ok {
+				_ = nf.SetVerdict(id, nfqueue.NfAccept)
+				return 0
+			}
+			if cfg.SkipMarkEnabled && a.Mark != nil &&
+				(*a.Mark&cfg.SkipMarkMask) == (cfg.SkipMarkValue&cfg.SkipMarkMask) {
+				_ = nf.SetVerdict(id, nfqueue.NfAccept)
+				return 0
+			}
+			first, second, err := core.SplitIPv4TCPPacket(*a.Payload, info, cfg.SplitAt)
+			if err != nil {
+				logVerbose(cfg.Verbose, "SPLIT-SKIP src=%s:%d dst=%s:%d seq=%d payload=%d packet=%d reason=%q", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, id, err)
+				_ = nf.SetVerdict(id, nfqueue.NfAccept)
+				return 0
+			}
+
+			mark := cfg.SplitMarkValue
+			if a.Mark != nil {
+				mark |= *a.Mark
+			}
+			if err := nf.SetVerdictModPacketWithMark(id, nfqueue.NfAccept, int(mark), first); err != nil {
+				fmt.Fprintf(os.Stderr, "[nfqcooldown] split verdict failed packet=%d: %v\n", id, err)
+				_ = nf.SetVerdict(id, nfqueue.NfAccept)
+				return 0
+			}
+			go func() {
+				if cfg.SplitDelay > 0 {
+					time.Sleep(cfg.SplitDelay)
+				}
+				if err := rawSender.Send(second, mark); err != nil {
+					fmt.Fprintf(os.Stderr, "[nfqcooldown] split raw send failed src=%s:%d dst=%s:%d seq=%d: %v\n", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq+uint32(cfg.SplitAt), err)
+				}
+			}()
+			logVerbose(cfg.Verbose, "SPLIT src=%s:%d dst=%s:%d seq=%d payload=%d parts=%d+%d packet=%d split_mark=0x%x", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, cfg.SplitAt, info.PayloadLen-cfg.SplitAt, id, cfg.SplitMarkValue)
 			return 0
 		}
 
@@ -714,6 +797,12 @@ func main() {
 
 func printStartupConfig(cfg Config, whitelistCount int) {
 	switch cfg.Action {
+	case "split":
+		fmt.Printf(
+			"[nfqcooldown] started queue=%d action=split packet=payload split_at=%d split_delay=%s split_mark=0x%x skip_mark=%s verbose=%v\n",
+			cfg.QueueNum, cfg.SplitAt, cfg.SplitDelay, cfg.SplitMarkValue, formatSkipMark(cfg), cfg.Verbose,
+		)
+
 	case "shape":
 		fmt.Printf(
 			"[nfqcooldown] started queue=%d action=shape packet=%s burst_interval=%s burst_max_delay=%s max_pending_delays=%d cleanup_every=%s cleanup_after=%s whitelist=%d skip_mark=%s reject_mark=%s verbose=%v seed=%d\n",

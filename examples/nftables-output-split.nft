@@ -1,0 +1,24 @@
+table ip nfqcooldown_split {
+    chain output_queue {
+        type filter hook output priority mangle; policy accept;
+
+        # telemt:443 -> client:ephemeral_port
+        # Replace eth0 if the public interface has another name.
+        oifname "eth0" \
+        meta l4proto tcp \
+        tcp sport 443 \
+        tcp payload length > 1 \
+        meta mark & 0x1000 == 0 \
+        ct mark & 0x1000 == 0 \
+        queue flags bypass to 444
+    }
+
+    chain output_save_mark {
+        type filter hook output priority mangle + 1; policy accept;
+
+        # The modified first segment continues in the next base chain.
+        # Persist its packet mark into conntrack before the raw second segment
+        # is emitted and before later packets of this connection are queued.
+        meta mark & 0x1000 != 0 ct mark set ct mark | 0x1000
+    }
+}

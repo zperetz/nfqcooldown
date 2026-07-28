@@ -6,8 +6,8 @@ import (
 )
 
 type ClientState struct {
-	LastSeen time.Time
-	Cooldown time.Duration
+	LastSeen  time.Time
+	Cooldown  time.Duration
 	DropCount int
 }
 
