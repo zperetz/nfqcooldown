@@ -54,6 +54,7 @@ type Config struct {
 	SplitMarkValue    uint32
 	SplitMarkSpec     string
 	SplitDelay        time.Duration
+	SplitSeenTTL      time.Duration
 }
 
 func parseConfig() Config {
@@ -81,6 +82,7 @@ func parseConfig() Config {
 	splitAt := flag.Int("split-at", 1, "payload byte offset for split action")
 	splitMarkStr := flag.String("split-mark", "0x1000", "packet mark set on split segments; nftables should persist it to ct mark")
 	splitDelayStr := flag.String("split-delay", "1ms", "delay before sending the second split segment")
+	splitSeenTTLStr := flag.String("split-seen-ttl", "1m", "remember split TCP segments for this duration and pass retransmissions unchanged")
 
 	flag.Usage = printUsage
 
@@ -110,6 +112,7 @@ func parseConfig() Config {
 	rejectMarkEnabled, rejectMarkValue := mustMark("reject-mark", *rejectMarkStr)
 	splitMarkEnabled, splitMarkValue := mustMark("split-mark", *splitMarkStr)
 	splitDelay := mustDuration("split-delay", *splitDelayStr)
+	splitSeenTTL := mustDuration("split-seen-ttl", *splitSeenTTLStr)
 
 	if *action != "drop" && *action != "shape" && *action != "split" {
 		fatalf("bad action %q: use drop, shape or split", *action)
@@ -137,6 +140,9 @@ func parseConfig() Config {
 	}
 	if splitDelay < 0 {
 		fatalf("bad split-delay %q: must be >= 0", *splitDelayStr)
+	}
+	if splitSeenTTL <= 0 {
+		fatalf("bad split-seen-ttl %q: must be > 0", *splitSeenTTLStr)
 	}
 	if *maxDropsPerIP < 0 {
 		fatalf("bad max-drops-per-ip %d: must be >= 0", *maxDropsPerIP)
@@ -183,6 +189,7 @@ func parseConfig() Config {
 		SplitMarkValue:    splitMarkValue,
 		SplitMarkSpec:     strings.TrimSpace(*splitMarkStr),
 		SplitDelay:        splitDelay,
+		SplitSeenTTL:      splitSeenTTL,
 	}
 }
 
@@ -295,6 +302,7 @@ SPLIT MODE:
     --split-at <n>                Split payload before byte n (default: 1)
     --split-mark <mark>           Packet mark for nftables persistence (default: 0x1000)
     --split-delay <duration>      Delay before second segment (default: 1ms)
+    --split-seen-ttl <duration>   Remember split segments and pass retransmits unchanged (default: 1m)
 
 SHAPE MODE:
     --burst-interval <duration>   Minimum interval between released SYN packets per IP
@@ -350,6 +358,15 @@ type burstPacerState struct {
 	LastRelease time.Time
 	LastSeen    time.Time
 	Pending     bool
+}
+
+type splitSegmentKey struct {
+	SrcIP      [4]byte
+	DstIP      [4]byte
+	SrcPort    uint16
+	DstPort    uint16
+	Seq        uint32
+	PayloadLen int
 }
 
 func main() {
@@ -413,9 +430,11 @@ func main() {
 	var pendingDelays int64
 	var burstPacerByIP sync.Map
 	var shapePendingFlows sync.Map
+	var splitSeen sync.Map
 
 	go cleanupLoop(ctx, state, cfg.CleanupEvery, cfg.CleanupAfter)
 	go shapeCleanupLoop(ctx, &burstPacerByIP, cfg.CleanupEvery, cfg.CleanupAfter)
+	go splitSeenCleanupLoop(ctx, &splitSeen, cfg.CleanupEvery, cfg.SplitSeenTTL)
 	go statsLoop(ctx, cfg, state, counters)
 
 	handler := func(a nfqueue.Attribute) int {
@@ -440,8 +459,28 @@ func main() {
 				_ = nf.SetVerdict(id, nfqueue.NfAccept)
 				return 0
 			}
+
+			var srcIPKey, dstIPKey [4]byte
+			copy(srcIPKey[:], info.SrcIP.To4())
+			copy(dstIPKey[:], info.DstIP.To4())
+
+			splitKey := splitSegmentKey{
+				SrcIP:      srcIPKey,
+				DstIP:      dstIPKey,
+				SrcPort:    info.SrcPort,
+				DstPort:    info.DstPort,
+				Seq:        info.Seq,
+				PayloadLen: info.PayloadLen,
+			}
+			if _, alreadySplit := splitSeen.LoadOrStore(splitKey, time.Now()); alreadySplit {
+				logVerbose(cfg.Verbose, "SPLIT-RETRANSMIT-PASS src=%s:%d dst=%s:%d seq=%d payload=%d packet=%d", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, id)
+				_ = nf.SetVerdict(id, nfqueue.NfAccept)
+				return 0
+			}
+
 			first, second, err := core.SplitIPv4TCPPacket(*a.Payload, info, cfg.SplitAt)
 			if err != nil {
+				splitSeen.Delete(splitKey)
 				logVerbose(cfg.Verbose, "SPLIT-SKIP src=%s:%d dst=%s:%d seq=%d payload=%d packet=%d reason=%q", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, id, err)
 				_ = nf.SetVerdict(id, nfqueue.NfAccept)
 				return 0
@@ -452,6 +491,7 @@ func main() {
 				mark |= *a.Mark
 			}
 			if err := nf.SetVerdictModPacketWithConnMark(id, nfqueue.NfAccept, int(mark), first); err != nil {
+				splitSeen.Delete(splitKey)
 				fmt.Fprintf(os.Stderr, "[nfqcooldown] split verdict failed packet=%d: %v\n", id, err)
 				_ = nf.SetVerdict(id, nfqueue.NfAccept)
 				return 0
@@ -801,8 +841,8 @@ func printStartupConfig(cfg Config, whitelistCount int) {
 	switch cfg.Action {
 	case "split":
 		fmt.Printf(
-			"[nfqcooldown] started queue=%d action=split packet=payload split_at=%d split_delay=%s split_mark=0x%x skip_mark=%s verbose=%v\n",
-			cfg.QueueNum, cfg.SplitAt, cfg.SplitDelay, cfg.SplitMarkValue, formatSkipMark(cfg), cfg.Verbose,
+			"[nfqcooldown] started queue=%d action=split packet=payload split_at=%d split_delay=%s split_mark=0x%x split_seen_ttl=%s skip_mark=%s verbose=%v\n",
+			cfg.QueueNum, cfg.SplitAt, cfg.SplitDelay, cfg.SplitMarkValue, cfg.SplitSeenTTL, formatSkipMark(cfg), cfg.Verbose,
 		)
 
 	case "shape":
@@ -960,6 +1000,38 @@ func printStats(
 				ev.Elapsed,
 				ev.Remaining,
 			)
+		}
+	}
+}
+
+func splitSeenCleanupLoop(
+	ctx context.Context,
+	splitSeen *sync.Map,
+	every time.Duration,
+	ttl time.Duration,
+) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+
+		case now := <-t.C:
+			removed := 0
+			splitSeen.Range(func(key, value any) bool {
+				seenAt, ok := value.(time.Time)
+				if !ok || now.Sub(seenAt) > ttl {
+					splitSeen.Delete(key)
+					removed++
+				}
+				return true
+			})
+
+			if removed > 0 {
+				fmt.Printf("[nfqcooldown] split cleanup removed=%d ttl=%s\n", removed, ttl)
+			}
 		}
 	}
 }
