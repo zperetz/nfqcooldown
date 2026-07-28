@@ -451,7 +451,7 @@ func main() {
 			if a.Mark != nil {
 				mark |= *a.Mark
 			}
-			if err := nf.SetVerdictModPacketWithMark(id, nfqueue.NfAccept, int(mark), first); err != nil {
+			if err := nf.SetVerdictModPacketWithConnMark(id, nfqueue.NfAccept, int(mark), first); err != nil {
 				fmt.Fprintf(os.Stderr, "[nfqcooldown] split verdict failed packet=%d: %v\n", id, err)
 				_ = nf.SetVerdict(id, nfqueue.NfAccept)
 				return 0
@@ -460,9 +460,11 @@ func main() {
 				if cfg.SplitDelay > 0 {
 					time.Sleep(cfg.SplitDelay)
 				}
-				if err := rawSender.Send(second, mark); err != nil {
-					fmt.Fprintf(os.Stderr, "[nfqcooldown] split raw send failed src=%s:%d dst=%s:%d seq=%d: %v\n", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq+uint32(cfg.SplitAt), err)
+				if err := rawSender.Send(second, 0); err != nil {
+					fmt.Fprintf(os.Stderr, "[nfqcooldown] split raw send failed src=%s:%d dst=%s:%d seq=%d len=%d: %v\n", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq+uint32(cfg.SplitAt), info.PayloadLen-cfg.SplitAt, err)
+					return
 				}
+				logVerbose(cfg.Verbose, "SPLIT-RAW-SENT src=%s:%d dst=%s:%d seq=%d payload=%d mark=0x0", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq+uint32(cfg.SplitAt), info.PayloadLen-cfg.SplitAt)
 			}()
 			logVerbose(cfg.Verbose, "SPLIT src=%s:%d dst=%s:%d seq=%d payload=%d parts=%d+%d packet=%d split_mark=0x%x", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, cfg.SplitAt, info.PayloadLen-cfg.SplitAt, id, cfg.SplitMarkValue)
 			return 0

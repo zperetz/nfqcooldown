@@ -111,6 +111,11 @@ func SplitIPv4TCPPacket(packet []byte, info TCPPayloadInfo, splitAt int) ([]byte
 	firstTCP[13] &^= 0x09
 	binary.BigEndian.PutUint32(secondTCP[4:8], info.Seq+uint32(splitAt))
 
+	// Mark the raw second segment in the IPv4 ID field. nftables can use
+	// this bit to prevent the injected segment from entering NFQUEUE again.
+	ipID := binary.BigEndian.Uint16(second[4:6])
+	binary.BigEndian.PutUint16(second[4:6], ipID|0x8000)
+
 	fixIPv4TCPChecksums(first, info.IPHeaderLen)
 	fixIPv4TCPChecksums(second, info.IPHeaderLen)
 	return first, second, nil
