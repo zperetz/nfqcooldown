@@ -290,7 +290,7 @@ Verbose mode logs individual packet decisions.
 
 ## systemd service
 
-Example service file:
+Example service file ```/etc/systemd/system/nfqcooldown.service```:
 
 ```ini
 [Unit]
