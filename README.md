@@ -26,10 +26,7 @@ This makes it possible to implement packet handling logic that is difficult or i
 * SYN burst shaping with bounded packet delays
 * Packet-mark bypass support
 * Packet marking for nftables-based active rejection
-* For DROP action:
-      Fixed cooldown mode
-      Random cooldown mode
-      Jitter cooldown mode
+* DROP action with fixed, random, and jitter cooldown modes
 * IP/CIDR whitelist
 * Verbose per-packet logging
 * Periodic aggregate statistics
