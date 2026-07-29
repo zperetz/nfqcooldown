@@ -56,6 +56,7 @@ type Config struct {
 	SplitDelay        time.Duration
 	SplitSeenTTL      time.Duration
 	SplitProbe        bool
+	SplitReverse      bool
 }
 
 func parseConfig() Config {
@@ -85,6 +86,7 @@ func parseConfig() Config {
 	splitDelayStr := flag.String("split-delay", "1ms", "delay before sending the second split segment")
 	splitSeenTTLStr := flag.String("split-seen-ttl", "1m", "remember split TCP segments for this duration and pass retransmissions unchanged")
 	splitProbe := flag.Bool("split-probe", false, "send only the first split segment and rely on TCP retransmission")
+	splitReverse := flag.Bool("split-reverse", false, "send the second split segment before the first")
 
 	flag.Usage = printUsage
 
@@ -143,6 +145,9 @@ func parseConfig() Config {
 	if splitDelay < 0 {
 		fatalf("bad split-delay %q: must be >= 0", *splitDelayStr)
 	}
+	if *splitProbe && *splitReverse {
+		fatalf("--split-probe and --split-reverse cannot be used together")
+	}
 	if splitSeenTTL <= 0 {
 		fatalf("bad split-seen-ttl %q: must be > 0", *splitSeenTTLStr)
 	}
@@ -193,6 +198,7 @@ func parseConfig() Config {
 		SplitDelay:        splitDelay,
 		SplitSeenTTL:      splitSeenTTL,
 		SplitProbe:        *splitProbe,
+		SplitReverse:      *splitReverse,
 	}
 }
 
@@ -307,6 +313,7 @@ SPLIT MODE:
     --split-delay <duration>      Delay before second segment (default: 1ms)
     --split-seen-ttl <duration>   Remember split segments and pass retransmits unchanged (default: 1m)
     --split-probe                 Send only the first part; rely on TCP retransmission
+    --split-reverse               Send the second part before the first
 
 SHAPE MODE:
     --burst-interval <duration>   Minimum interval between released SYN packets per IP
@@ -494,6 +501,40 @@ func main() {
 			if a.Mark != nil {
 				mark |= *a.Mark
 			}
+
+			secondKey := splitSegmentKey{
+				SrcIP:      srcIPKey,
+				DstIP:      dstIPKey,
+				SrcPort:    info.SrcPort,
+				DstPort:    info.DstPort,
+				Seq:        info.Seq + uint32(cfg.SplitAt),
+				PayloadLen: info.PayloadLen - cfg.SplitAt,
+			}
+
+			if cfg.SplitReverse {
+				splitSeen.Store(secondKey, time.Now())
+				if err := rawSender.Send(second, mark); err != nil {
+					splitSeen.Delete(splitKey)
+					splitSeen.Delete(secondKey)
+					fmt.Fprintf(os.Stderr, "[nfqcooldown] reverse split raw send failed src=%s:%d dst=%s:%d seq=%d len=%d: %v\n", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq+uint32(cfg.SplitAt), info.PayloadLen-cfg.SplitAt, err)
+					_ = nf.SetVerdict(id, nfqueue.NfAccept)
+					return 0
+				}
+				logVerbose(cfg.Verbose, "SPLIT-REVERSE-RAW-SENT src=%s:%d dst=%s:%d seq=%d payload=%d mark=0x%x", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq+uint32(cfg.SplitAt), info.PayloadLen-cfg.SplitAt, mark)
+
+				if cfg.SplitDelay > 0 {
+					time.Sleep(cfg.SplitDelay)
+				}
+				if err := nf.SetVerdictModPacketWithConnMark(id, nfqueue.NfAccept, int(mark), first); err != nil {
+					splitSeen.Delete(splitKey)
+					fmt.Fprintf(os.Stderr, "[nfqcooldown] reverse split verdict failed packet=%d: %v\n", id, err)
+					_ = nf.SetVerdict(id, nfqueue.NfAccept)
+					return 0
+				}
+				logVerbose(cfg.Verbose, "SPLIT-REVERSE src=%s:%d dst=%s:%d seq=%d payload=%d order=%d+%d packet=%d split_mark=0x%x delay=%s", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, info.PayloadLen-cfg.SplitAt, cfg.SplitAt, id, cfg.SplitMarkValue, cfg.SplitDelay)
+				return 0
+			}
+
 			if err := nf.SetVerdictModPacketWithConnMark(id, nfqueue.NfAccept, int(mark), first); err != nil {
 				splitSeen.Delete(splitKey)
 				fmt.Fprintf(os.Stderr, "[nfqcooldown] split verdict failed packet=%d: %v\n", id, err)
@@ -505,16 +546,7 @@ func main() {
 				return 0
 			}
 
-			secondKey := splitSegmentKey{
-				SrcIP:      srcIPKey,
-				DstIP:      dstIPKey,
-				SrcPort:    info.SrcPort,
-				DstPort:    info.DstPort,
-				Seq:        info.Seq + uint32(cfg.SplitAt),
-				PayloadLen: info.PayloadLen - cfg.SplitAt,
-			}
 			splitSeen.Store(secondKey, time.Now())
-
 			go func() {
 				if cfg.SplitDelay > 0 {
 					time.Sleep(cfg.SplitDelay)
@@ -861,8 +893,8 @@ func printStartupConfig(cfg Config, whitelistCount int) {
 	switch cfg.Action {
 	case "split":
 		fmt.Printf(
-			"[nfqcooldown] started queue=%d action=split packet=payload split_at=%d split_delay=%s split_mark=0x%x split_seen_ttl=%s split_probe=%v skip_mark=%s verbose=%v\n",
-			cfg.QueueNum, cfg.SplitAt, cfg.SplitDelay, cfg.SplitMarkValue, cfg.SplitSeenTTL, cfg.SplitProbe, formatSkipMark(cfg), cfg.Verbose,
+			"[nfqcooldown] started queue=%d action=split packet=payload split_at=%d split_delay=%s split_mark=0x%x split_seen_ttl=%s split_probe=%v split_reverse=%v skip_mark=%s verbose=%v\n",
+			cfg.QueueNum, cfg.SplitAt, cfg.SplitDelay, cfg.SplitMarkValue, cfg.SplitSeenTTL, cfg.SplitProbe, cfg.SplitReverse, formatSkipMark(cfg), cfg.Verbose,
 		)
 
 	case "shape":
