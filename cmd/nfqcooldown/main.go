@@ -57,6 +57,8 @@ type Config struct {
 	SplitSeenTTL      time.Duration
 	SplitProbe        bool
 	SplitReverse      bool
+	FakeBadChecksum   bool
+	FakeDelay         time.Duration
 }
 
 func parseConfig() Config {
@@ -87,6 +89,8 @@ func parseConfig() Config {
 	splitSeenTTLStr := flag.String("split-seen-ttl", "1m", "remember split TCP segments for this duration and pass retransmissions unchanged")
 	splitProbe := flag.Bool("split-probe", false, "send only the first split segment and rely on TCP retransmission")
 	splitReverse := flag.Bool("split-reverse", false, "send the second split segment before the first")
+	fakeBadChecksum := flag.Bool("fake-bad-checksum", false, "send a copy with an invalid TCP checksum before the original payload packet")
+	fakeDelayStr := flag.String("fake-delay", "5ms", "delay between the bad-checksum fake and the original packet")
 
 	flag.Usage = printUsage
 
@@ -117,6 +121,7 @@ func parseConfig() Config {
 	splitMarkEnabled, splitMarkValue := mustMark("split-mark", *splitMarkStr)
 	splitDelay := mustDuration("split-delay", *splitDelayStr)
 	splitSeenTTL := mustDuration("split-seen-ttl", *splitSeenTTLStr)
+	fakeDelay := mustDuration("fake-delay", *fakeDelayStr)
 
 	if *action != "drop" && *action != "shape" && *action != "split" {
 		fatalf("bad action %q: use drop, shape or split", *action)
@@ -147,6 +152,12 @@ func parseConfig() Config {
 	}
 	if *splitProbe && *splitReverse {
 		fatalf("--split-probe and --split-reverse cannot be used together")
+	}
+	if *fakeBadChecksum && (*splitProbe || *splitReverse) {
+		fatalf("--fake-bad-checksum cannot be combined with --split-probe or --split-reverse")
+	}
+	if fakeDelay < 0 {
+		fatalf("bad fake-delay %q: must be >= 0", *fakeDelayStr)
 	}
 	if splitSeenTTL <= 0 {
 		fatalf("bad split-seen-ttl %q: must be > 0", *splitSeenTTLStr)
@@ -199,6 +210,8 @@ func parseConfig() Config {
 		SplitSeenTTL:      splitSeenTTL,
 		SplitProbe:        *splitProbe,
 		SplitReverse:      *splitReverse,
+		FakeBadChecksum:   *fakeBadChecksum,
+		FakeDelay:         fakeDelay,
 	}
 }
 
@@ -314,6 +327,8 @@ SPLIT MODE:
     --split-seen-ttl <duration>   Remember split segments and pass retransmits unchanged (default: 1m)
     --split-probe                 Send only the first part; rely on TCP retransmission
     --split-reverse               Send the second part before the first
+    --fake-bad-checksum           Send invalid-checksum fake, then the original packet
+    --fake-delay <duration>       Delay between fake and original (default: 5ms)
 
 SHAPE MODE:
     --burst-interval <duration>   Minimum interval between released SYN packets per IP
@@ -378,6 +393,35 @@ type splitSegmentKey struct {
 	DstPort    uint16
 	Seq        uint32
 	PayloadLen int
+}
+
+func cloneWithBadTCPChecksum(packet []byte) ([]byte, uint16, uint16, error) {
+	if len(packet) < 20 {
+		return nil, 0, 0, fmt.Errorf("IPv4 packet too short: %d", len(packet))
+	}
+	if packet[0]>>4 != 4 {
+		return nil, 0, 0, fmt.Errorf("not IPv4")
+	}
+
+	ipHeaderLen := int(packet[0]&0x0f) * 4
+	if ipHeaderLen < 20 || len(packet) < ipHeaderLen+20 {
+		return nil, 0, 0, fmt.Errorf("invalid IPv4/TCP header length")
+	}
+	if packet[9] != 6 {
+		return nil, 0, 0, fmt.Errorf("not TCP")
+	}
+
+	checksumOffset := ipHeaderLen + 16
+	original := uint16(packet[checksumOffset])<<8 | uint16(packet[checksumOffset+1])
+	corrupted := original ^ 0xffff
+	if corrupted == 0 {
+		corrupted = 1
+	}
+
+	fake := append([]byte(nil), packet...)
+	fake[checksumOffset] = byte(corrupted >> 8)
+	fake[checksumOffset+1] = byte(corrupted)
+	return fake, original, corrupted, nil
 }
 
 func main() {
@@ -489,17 +533,47 @@ func main() {
 				return 0
 			}
 
+			mark := cfg.SplitMarkValue
+			if a.Mark != nil {
+				mark |= *a.Mark
+			}
+
+			if cfg.FakeBadChecksum {
+				fake, originalChecksum, fakeChecksum, err := cloneWithBadTCPChecksum(*a.Payload)
+				if err != nil {
+					splitSeen.Delete(splitKey)
+					logVerbose(cfg.Verbose, "FAKE-BAD-CHECKSUM-SKIP src=%s:%d dst=%s:%d seq=%d payload=%d packet=%d reason=%q", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, id, err)
+					_ = nf.SetVerdict(id, nfqueue.NfAccept)
+					return 0
+				}
+
+				if err := rawSender.Send(fake, mark); err != nil {
+					splitSeen.Delete(splitKey)
+					fmt.Fprintf(os.Stderr, "[nfqcooldown] fake bad-checksum raw send failed src=%s:%d dst=%s:%d seq=%d len=%d: %v\n", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, err)
+					_ = nf.SetVerdict(id, nfqueue.NfAccept)
+					return 0
+				}
+				logVerbose(cfg.Verbose, "FAKE-BAD-CHECKSUM-SENT src=%s:%d dst=%s:%d seq=%d payload=%d tcp_checksum=0x%04x->0x%04x mark=0x%x", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, originalChecksum, fakeChecksum, mark)
+
+				if cfg.FakeDelay > 0 {
+					time.Sleep(cfg.FakeDelay)
+				}
+				if err := nf.SetVerdictModPacketWithConnMark(id, nfqueue.NfAccept, int(mark), *a.Payload); err != nil {
+					splitSeen.Delete(splitKey)
+					fmt.Fprintf(os.Stderr, "[nfqcooldown] fake original verdict failed packet=%d: %v\n", id, err)
+					_ = nf.SetVerdict(id, nfqueue.NfAccept)
+					return 0
+				}
+				logVerbose(cfg.Verbose, "FAKE-BAD-CHECKSUM-ORIGINAL src=%s:%d dst=%s:%d seq=%d payload=%d packet=%d delay=%s mark=0x%x", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, id, cfg.FakeDelay, mark)
+				return 0
+			}
+
 			first, second, err := core.SplitIPv4TCPPacket(*a.Payload, info, cfg.SplitAt)
 			if err != nil {
 				splitSeen.Delete(splitKey)
 				logVerbose(cfg.Verbose, "SPLIT-SKIP src=%s:%d dst=%s:%d seq=%d payload=%d packet=%d reason=%q", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, id, err)
 				_ = nf.SetVerdict(id, nfqueue.NfAccept)
 				return 0
-			}
-
-			mark := cfg.SplitMarkValue
-			if a.Mark != nil {
-				mark |= *a.Mark
 			}
 
 			secondKey := splitSegmentKey{
@@ -893,8 +967,8 @@ func printStartupConfig(cfg Config, whitelistCount int) {
 	switch cfg.Action {
 	case "split":
 		fmt.Printf(
-			"[nfqcooldown] started queue=%d action=split packet=payload split_at=%d split_delay=%s split_mark=0x%x split_seen_ttl=%s split_probe=%v split_reverse=%v skip_mark=%s verbose=%v\n",
-			cfg.QueueNum, cfg.SplitAt, cfg.SplitDelay, cfg.SplitMarkValue, cfg.SplitSeenTTL, cfg.SplitProbe, cfg.SplitReverse, formatSkipMark(cfg), cfg.Verbose,
+			"[nfqcooldown] started queue=%d action=split packet=payload split_at=%d split_delay=%s split_mark=0x%x split_seen_ttl=%s split_probe=%v split_reverse=%v fake_bad_checksum=%v fake_delay=%s skip_mark=%s verbose=%v\n",
+			cfg.QueueNum, cfg.SplitAt, cfg.SplitDelay, cfg.SplitMarkValue, cfg.SplitSeenTTL, cfg.SplitProbe, cfg.SplitReverse, cfg.FakeBadChecksum, cfg.FakeDelay, formatSkipMark(cfg), cfg.Verbose,
 		)
 
 	case "shape":
