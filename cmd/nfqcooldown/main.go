@@ -62,6 +62,7 @@ type Config struct {
 	FakePayload       string
 	FakeLength        int
 	FakeDelay         time.Duration
+	PassWindow        time.Duration
 }
 
 func parseConfig() Config {
@@ -96,6 +97,7 @@ func parseConfig() Config {
 	fakePayload := flag.String("fake-payload", "tls-invalid-length", "fake payload: copy or tls-invalid-length")
 	fakeLength := flag.Int("fake-length", 0, "fake TCP payload length; 0 keeps the original payload length")
 	fakeDelayStr := flag.String("fake-delay", "5ms", "delay between the fake and the real packet or reverse split")
+	passWindowStr := flag.String("pass-window", "0", "pass the first TCP flow normally, then split new flows to the same client within this fixed window; 0 disables")
 
 	flag.Usage = printUsage
 
@@ -127,6 +129,7 @@ func parseConfig() Config {
 	splitDelay := mustDuration("split-delay", *splitDelayStr)
 	splitSeenTTL := mustDuration("split-seen-ttl", *splitSeenTTLStr)
 	fakeDelay := mustDuration("fake-delay", *fakeDelayStr)
+	passWindow := mustDuration("pass-window", *passWindowStr)
 
 	if *action != "drop" && *action != "shape" && *action != "split" {
 		fatalf("bad action %q: use drop, shape or split", *action)
@@ -172,6 +175,9 @@ func parseConfig() Config {
 	}
 	if fakeDelay < 0 {
 		fatalf("bad fake-delay %q: must be >= 0", *fakeDelayStr)
+	}
+	if passWindow < 0 {
+		fatalf("bad pass-window %q: must be >= 0", *passWindowStr)
 	}
 	if splitSeenTTL <= 0 {
 		fatalf("bad split-seen-ttl %q: must be > 0", *splitSeenTTLStr)
@@ -228,6 +234,7 @@ func parseConfig() Config {
 		FakePayload:       *fakePayload,
 		FakeLength:        *fakeLength,
 		FakeDelay:         fakeDelay,
+		PassWindow:        passWindow,
 	}
 }
 
@@ -347,6 +354,7 @@ SPLIT MODE:
     --fake-payload <mode>         Fake payload: copy or tls-invalid-length
     --fake-length <n>             Fake TCP payload bytes; 0 keeps original length
     --fake-delay <duration>       Delay between fake and real data (default: 5ms)
+    --pass-window <duration>      Pass first flow normally, split later flows to same client inside fixed window; 0 disables
 
 SHAPE MODE:
     --burst-interval <duration>   Minimum interval between released SYN packets per IP
@@ -402,6 +410,79 @@ type burstPacerState struct {
 	LastRelease time.Time
 	LastSeen    time.Time
 	Pending     bool
+}
+
+type splitFlowKey struct {
+	SrcIP   [4]byte
+	DstIP   [4]byte
+	SrcPort uint16
+	DstPort uint16
+}
+
+type splitFlowDecision struct {
+	Split  bool
+	SeenAt time.Time
+}
+
+type splitPassWindowState struct {
+	mu       sync.Mutex
+	lastPass map[[4]byte]time.Time
+	flows    map[splitFlowKey]splitFlowDecision
+}
+
+func newSplitPassWindowState() *splitPassWindowState {
+	return &splitPassWindowState{
+		lastPass: make(map[[4]byte]time.Time),
+		flows:    make(map[splitFlowKey]splitFlowDecision),
+	}
+}
+
+func (s *splitPassWindowState) decide(flow splitFlowKey, clientIP [4]byte, now time.Time, window time.Duration) (split bool, existing bool, sincePass time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if decision, ok := s.flows[flow]; ok {
+		decision.SeenAt = now
+		s.flows[flow] = decision
+		last := s.lastPass[clientIP]
+		if !last.IsZero() {
+			sincePass = now.Sub(last)
+		}
+		return decision.Split, true, sincePass
+	}
+
+	last := s.lastPass[clientIP]
+	if last.IsZero() || now.Sub(last) >= window {
+		s.lastPass[clientIP] = now
+		s.flows[flow] = splitFlowDecision{Split: false, SeenAt: now}
+		if !last.IsZero() {
+			sincePass = now.Sub(last)
+		}
+		return false, false, sincePass
+	}
+
+	sincePass = now.Sub(last)
+	s.flows[flow] = splitFlowDecision{Split: true, SeenAt: now}
+	return true, false, sincePass
+}
+
+func (s *splitPassWindowState) cleanup(now time.Time, flowTTL, passTTL time.Duration) (flowsRemoved, passesRemoved int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for key, decision := range s.flows {
+		if now.Sub(decision.SeenAt) > flowTTL {
+			delete(s.flows, key)
+			flowsRemoved++
+		}
+	}
+	for clientIP, last := range s.lastPass {
+		if now.Sub(last) > passTTL {
+			delete(s.lastPass, clientIP)
+			passesRemoved++
+		}
+	}
+	return flowsRemoved, passesRemoved
 }
 
 type splitSegmentKey struct {
@@ -590,10 +671,14 @@ func main() {
 	var burstPacerByIP sync.Map
 	var shapePendingFlows sync.Map
 	var splitSeen sync.Map
+	splitPassWindow := newSplitPassWindowState()
 
 	go cleanupLoop(ctx, state, cfg.CleanupEvery, cfg.CleanupAfter)
 	go shapeCleanupLoop(ctx, &burstPacerByIP, cfg.CleanupEvery, cfg.CleanupAfter)
 	go splitSeenCleanupLoop(ctx, &splitSeen, cfg.CleanupEvery, cfg.SplitSeenTTL)
+	if cfg.PassWindow > 0 {
+		go splitPassWindowCleanupLoop(ctx, splitPassWindow, cfg.CleanupEvery, cfg.SplitSeenTTL, cfg.PassWindow)
+	}
 	go statsLoop(ctx, cfg, state, counters)
 
 	handler := func(a nfqueue.Attribute) int {
@@ -622,6 +707,26 @@ func main() {
 			var srcIPKey, dstIPKey [4]byte
 			copy(srcIPKey[:], info.SrcIP.To4())
 			copy(dstIPKey[:], info.DstIP.To4())
+
+			if cfg.PassWindow > 0 {
+				flowKey := splitFlowKey{
+					SrcIP: srcIPKey, DstIP: dstIPKey,
+					SrcPort: info.SrcPort, DstPort: info.DstPort,
+				}
+				shouldSplit, existingFlow, sincePass := splitPassWindow.decide(flowKey, dstIPKey, time.Now(), cfg.PassWindow)
+				if !shouldSplit {
+					event := "SPLIT-PASS-FLOW"
+					if !existingFlow {
+						event = "SPLIT-PASS-WINDOW"
+					}
+					logVerbose(cfg.Verbose, "%s src=%s:%d dst=%s:%d seq=%d payload=%d packet=%d pass_window=%s since_pass=%s", event, info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, id, cfg.PassWindow, sincePass)
+					_ = nf.SetVerdict(id, nfqueue.NfAccept)
+					return 0
+				}
+				if !existingFlow {
+					logVerbose(cfg.Verbose, "SPLIT-ACTIVE-WINDOW src=%s:%d dst=%s:%d seq=%d payload=%d packet=%d since_pass=%s pass_window=%s", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, id, sincePass, cfg.PassWindow)
+				}
+			}
 
 			splitKey := splitSegmentKey{
 				SrcIP:      srcIPKey,
@@ -1076,8 +1181,8 @@ func printStartupConfig(cfg Config, whitelistCount int) {
 	switch cfg.Action {
 	case "split":
 		fmt.Printf(
-			"[nfqcooldown] started queue=%d action=split packet=payload split_at=%d split_delay=%s split_mark=0x%x split_seen_ttl=%s split_probe=%v split_reverse=%v fake_bad_checksum=%v fake_payload=%s fake_length=%d fake_delay=%s skip_mark=%s verbose=%v\n",
-			cfg.QueueNum, cfg.SplitAt, cfg.SplitDelay, cfg.SplitMarkValue, cfg.SplitSeenTTL, cfg.SplitProbe, cfg.SplitReverse, cfg.FakeBadChecksum, cfg.FakePayload, cfg.FakeLength, cfg.FakeDelay, formatSkipMark(cfg), cfg.Verbose,
+			"[nfqcooldown] started queue=%d action=split packet=payload split_at=%d split_delay=%s split_mark=0x%x split_seen_ttl=%s split_probe=%v split_reverse=%v fake_bad_checksum=%v fake_payload=%s fake_length=%d fake_delay=%s pass_window=%s skip_mark=%s verbose=%v\n",
+			cfg.QueueNum, cfg.SplitAt, cfg.SplitDelay, cfg.SplitMarkValue, cfg.SplitSeenTTL, cfg.SplitProbe, cfg.SplitReverse, cfg.FakeBadChecksum, cfg.FakePayload, cfg.FakeLength, cfg.FakeDelay, cfg.PassWindow, formatSkipMark(cfg), cfg.Verbose,
 		)
 
 	case "shape":
@@ -1235,6 +1340,34 @@ func printStats(
 				ev.Elapsed,
 				ev.Remaining,
 			)
+		}
+	}
+}
+
+func splitPassWindowCleanupLoop(
+	ctx context.Context,
+	state *splitPassWindowState,
+	every time.Duration,
+	flowTTL time.Duration,
+	passWindow time.Duration,
+) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+
+	passTTL := passWindow * 2
+	if passTTL < every {
+		passTTL = every
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			flowsRemoved, passesRemoved := state.cleanup(now, flowTTL, passTTL)
+			if flowsRemoved > 0 || passesRemoved > 0 {
+				fmt.Printf("[nfqcooldown] split pass-window cleanup flows_removed=%d passes_removed=%d flow_ttl=%s pass_ttl=%s\n", flowsRemoved, passesRemoved, flowTTL, passTTL)
+			}
 		}
 	}
 }
