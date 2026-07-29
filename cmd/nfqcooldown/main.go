@@ -486,12 +486,23 @@ func main() {
 				return 0
 			}
 
+			secondKey := splitSegmentKey{
+				SrcIP:      srcIPKey,
+				DstIP:      dstIPKey,
+				SrcPort:    info.SrcPort,
+				DstPort:    info.DstPort,
+				Seq:        info.Seq + uint32(cfg.SplitAt),
+				PayloadLen: info.PayloadLen - cfg.SplitAt,
+			}
+			splitSeen.Store(secondKey, time.Now())
+
 			mark := cfg.SplitMarkValue
 			if a.Mark != nil {
 				mark |= *a.Mark
 			}
 			if err := nf.SetVerdictModPacketWithConnMark(id, nfqueue.NfAccept, int(mark), first); err != nil {
 				splitSeen.Delete(splitKey)
+				splitSeen.Delete(secondKey)
 				fmt.Fprintf(os.Stderr, "[nfqcooldown] split verdict failed packet=%d: %v\n", id, err)
 				_ = nf.SetVerdict(id, nfqueue.NfAccept)
 				return 0
@@ -501,6 +512,7 @@ func main() {
 					time.Sleep(cfg.SplitDelay)
 				}
 				if err := rawSender.Send(second, mark); err != nil {
+					splitSeen.Delete(secondKey)
 					fmt.Fprintf(os.Stderr, "[nfqcooldown] split raw send failed src=%s:%d dst=%s:%d seq=%d len=%d: %v\n", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq+uint32(cfg.SplitAt), info.PayloadLen-cfg.SplitAt, err)
 					return
 				}
