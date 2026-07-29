@@ -97,7 +97,7 @@ func parseConfig() Config {
 	fakePayload := flag.String("fake-payload", "tls-invalid-length", "fake payload: copy or tls-invalid-length")
 	fakeLength := flag.Int("fake-length", 0, "fake TCP payload length; 0 keeps the original payload length")
 	fakeDelayStr := flag.String("fake-delay", "5ms", "delay between the fake and the real packet or reverse split")
-	passWindowStr := flag.String("pass-window", "0", "pass the first TCP flow normally, then split new flows to the same client within this fixed window; 0 disables")
+	passWindowStr := flag.String("pass-window", "0", "pass the first TLS ServerHello normally, then split later ServerHello packets to the same client within this fixed window; 0 disables")
 
 	flag.Usage = printUsage
 
@@ -354,7 +354,7 @@ SPLIT MODE:
     --fake-payload <mode>         Fake payload: copy or tls-invalid-length
     --fake-length <n>             Fake TCP payload bytes; 0 keeps original length
     --fake-delay <duration>       Delay between fake and real data (default: 5ms)
-    --pass-window <duration>      Pass first flow normally, split later flows to same client inside fixed window; 0 disables
+    --pass-window <duration>      Pass first ServerHello normally, split later ServerHello packets inside fixed window; 0 disables
 
 SHAPE MODE:
     --burst-interval <duration>   Minimum interval between released SYN packets per IP
@@ -412,77 +412,68 @@ type burstPacerState struct {
 	Pending     bool
 }
 
-type splitFlowKey struct {
-	SrcIP   [4]byte
-	DstIP   [4]byte
-	SrcPort uint16
-	DstPort uint16
-}
-
-type splitFlowDecision struct {
-	Split  bool
-	SeenAt time.Time
-}
-
-type splitPassWindowState struct {
+type splitServerHelloWindowState struct {
 	mu       sync.Mutex
 	lastPass map[[4]byte]time.Time
-	flows    map[splitFlowKey]splitFlowDecision
 }
 
-func newSplitPassWindowState() *splitPassWindowState {
-	return &splitPassWindowState{
+func newSplitServerHelloWindowState() *splitServerHelloWindowState {
+	return &splitServerHelloWindowState{
 		lastPass: make(map[[4]byte]time.Time),
-		flows:    make(map[splitFlowKey]splitFlowDecision),
 	}
 }
 
-func (s *splitPassWindowState) decide(flow splitFlowKey, clientIP [4]byte, now time.Time, window time.Duration) (split bool, existing bool, sincePass time.Duration) {
+func (s *splitServerHelloWindowState) decide(clientIP [4]byte, now time.Time, window time.Duration) (split bool, sincePass time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	if decision, ok := s.flows[flow]; ok {
-		decision.SeenAt = now
-		s.flows[flow] = decision
-		last := s.lastPass[clientIP]
-		if !last.IsZero() {
-			sincePass = now.Sub(last)
-		}
-		return decision.Split, true, sincePass
-	}
 
 	last := s.lastPass[clientIP]
 	if last.IsZero() || now.Sub(last) >= window {
 		s.lastPass[clientIP] = now
-		s.flows[flow] = splitFlowDecision{Split: false, SeenAt: now}
 		if !last.IsZero() {
 			sincePass = now.Sub(last)
 		}
-		return false, false, sincePass
+		return false, sincePass
 	}
 
-	sincePass = now.Sub(last)
-	s.flows[flow] = splitFlowDecision{Split: true, SeenAt: now}
-	return true, false, sincePass
+	return true, now.Sub(last)
 }
 
-func (s *splitPassWindowState) cleanup(now time.Time, flowTTL, passTTL time.Duration) (flowsRemoved, passesRemoved int) {
+func (s *splitServerHelloWindowState) cleanup(now time.Time, ttl time.Duration) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for key, decision := range s.flows {
-		if now.Sub(decision.SeenAt) > flowTTL {
-			delete(s.flows, key)
-			flowsRemoved++
-		}
-	}
+	removed := 0
 	for clientIP, last := range s.lastPass {
-		if now.Sub(last) > passTTL {
+		if now.Sub(last) > ttl {
 			delete(s.lastPass, clientIP)
-			passesRemoved++
+			removed++
 		}
 	}
-	return flowsRemoved, passesRemoved
+	return removed
+}
+
+func isTLSServerHello(packet []byte) bool {
+	if len(packet) < 20 || packet[0]>>4 != 4 || packet[9] != 6 {
+		return false
+	}
+
+	ipHeaderLen := int(packet[0]&0x0f) * 4
+	if ipHeaderLen < 20 || len(packet) < ipHeaderLen+20 {
+		return false
+	}
+
+	tcpHeaderLen := int(packet[ipHeaderLen+12]>>4) * 4
+	payloadOffset := ipHeaderLen + tcpHeaderLen
+	if tcpHeaderLen < 20 || payloadOffset+6 > len(packet) {
+		return false
+	}
+
+	payload := packet[payloadOffset:]
+	return payload[0] == 0x16 && // TLS Handshake record
+		payload[1] == 0x03 && // TLS major version
+		payload[2] <= 0x04 && // SSLv3 through TLS 1.3 legacy record version
+		payload[5] == 0x02 // ServerHello handshake message
 }
 
 type splitSegmentKey struct {
@@ -671,13 +662,13 @@ func main() {
 	var burstPacerByIP sync.Map
 	var shapePendingFlows sync.Map
 	var splitSeen sync.Map
-	splitPassWindow := newSplitPassWindowState()
+	splitServerHelloWindow := newSplitServerHelloWindowState()
 
 	go cleanupLoop(ctx, state, cfg.CleanupEvery, cfg.CleanupAfter)
 	go shapeCleanupLoop(ctx, &burstPacerByIP, cfg.CleanupEvery, cfg.CleanupAfter)
 	go splitSeenCleanupLoop(ctx, &splitSeen, cfg.CleanupEvery, cfg.SplitSeenTTL)
 	if cfg.PassWindow > 0 {
-		go splitPassWindowCleanupLoop(ctx, splitPassWindow, cfg.CleanupEvery, cfg.SplitSeenTTL, cfg.PassWindow)
+		go splitServerHelloWindowCleanupLoop(ctx, splitServerHelloWindow, cfg.CleanupEvery, cfg.PassWindow)
 	}
 	go statsLoop(ctx, cfg, state, counters)
 
@@ -709,23 +700,20 @@ func main() {
 			copy(dstIPKey[:], info.DstIP.To4())
 
 			if cfg.PassWindow > 0 {
-				flowKey := splitFlowKey{
-					SrcIP: srcIPKey, DstIP: dstIPKey,
-					SrcPort: info.SrcPort, DstPort: info.DstPort,
-				}
-				shouldSplit, existingFlow, sincePass := splitPassWindow.decide(flowKey, dstIPKey, time.Now(), cfg.PassWindow)
-				if !shouldSplit {
-					event := "SPLIT-PASS-FLOW"
-					if !existingFlow {
-						event = "SPLIT-PASS-WINDOW"
-					}
-					logVerbose(cfg.Verbose, "%s src=%s:%d dst=%s:%d seq=%d payload=%d packet=%d pass_window=%s since_pass=%s", event, info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, id, cfg.PassWindow, sincePass)
+				if !isTLSServerHello(*a.Payload) {
+					logVerbose(cfg.Verbose, "SPLIT-PASS-NOT-SERVERHELLO src=%s:%d dst=%s:%d seq=%d payload=%d packet=%d", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, id)
 					_ = nf.SetVerdict(id, nfqueue.NfAccept)
 					return 0
 				}
-				if !existingFlow {
-					logVerbose(cfg.Verbose, "SPLIT-ACTIVE-WINDOW src=%s:%d dst=%s:%d seq=%d payload=%d packet=%d since_pass=%s pass_window=%s", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, id, sincePass, cfg.PassWindow)
+
+				shouldSplit, sincePass := splitServerHelloWindow.decide(dstIPKey, time.Now(), cfg.PassWindow)
+				if !shouldSplit {
+					logVerbose(cfg.Verbose, "SPLIT-PASS-SERVERHELLO src=%s:%d dst=%s:%d seq=%d payload=%d packet=%d pass_window=%s since_pass=%s", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, id, cfg.PassWindow, sincePass)
+					_ = nf.SetVerdict(id, nfqueue.NfAccept)
+					return 0
 				}
+
+				logVerbose(cfg.Verbose, "SPLIT-ACTIVE-SERVERHELLO src=%s:%d dst=%s:%d seq=%d payload=%d packet=%d since_pass=%s pass_window=%s", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, id, sincePass, cfg.PassWindow)
 			}
 
 			splitKey := splitSegmentKey{
@@ -1344,19 +1332,18 @@ func printStats(
 	}
 }
 
-func splitPassWindowCleanupLoop(
+func splitServerHelloWindowCleanupLoop(
 	ctx context.Context,
-	state *splitPassWindowState,
+	state *splitServerHelloWindowState,
 	every time.Duration,
-	flowTTL time.Duration,
 	passWindow time.Duration,
 ) {
 	t := time.NewTicker(every)
 	defer t.Stop()
 
-	passTTL := passWindow * 2
-	if passTTL < every {
-		passTTL = every
+	ttl := passWindow * 2
+	if ttl < every {
+		ttl = every
 	}
 
 	for {
@@ -1364,9 +1351,9 @@ func splitPassWindowCleanupLoop(
 		case <-ctx.Done():
 			return
 		case now := <-t.C:
-			flowsRemoved, passesRemoved := state.cleanup(now, flowTTL, passTTL)
-			if flowsRemoved > 0 || passesRemoved > 0 {
-				fmt.Printf("[nfqcooldown] split pass-window cleanup flows_removed=%d passes_removed=%d flow_ttl=%s pass_ttl=%s\n", flowsRemoved, passesRemoved, flowTTL, passTTL)
+			removed := state.cleanup(now, ttl)
+			if removed > 0 {
+				fmt.Printf("[nfqcooldown] split ServerHello-window cleanup removed=%d ttl=%s\n", removed, ttl)
 			}
 		}
 	}
