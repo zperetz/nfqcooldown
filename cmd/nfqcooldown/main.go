@@ -55,6 +55,7 @@ type Config struct {
 	SplitMarkSpec     string
 	SplitDelay        time.Duration
 	SplitSeenTTL      time.Duration
+	SplitProbe        bool
 }
 
 func parseConfig() Config {
@@ -83,6 +84,7 @@ func parseConfig() Config {
 	splitMarkStr := flag.String("split-mark", "0x1000", "packet mark set on split segments; nftables should persist it to ct mark")
 	splitDelayStr := flag.String("split-delay", "1ms", "delay before sending the second split segment")
 	splitSeenTTLStr := flag.String("split-seen-ttl", "1m", "remember split TCP segments for this duration and pass retransmissions unchanged")
+	splitProbe := flag.Bool("split-probe", false, "send only the first split segment and rely on TCP retransmission")
 
 	flag.Usage = printUsage
 
@@ -190,6 +192,7 @@ func parseConfig() Config {
 		SplitMarkSpec:     strings.TrimSpace(*splitMarkStr),
 		SplitDelay:        splitDelay,
 		SplitSeenTTL:      splitSeenTTL,
+		SplitProbe:        *splitProbe,
 	}
 }
 
@@ -303,6 +306,7 @@ SPLIT MODE:
     --split-mark <mark>           Packet mark for nftables persistence (default: 0x1000)
     --split-delay <duration>      Delay before second segment (default: 1ms)
     --split-seen-ttl <duration>   Remember split segments and pass retransmits unchanged (default: 1m)
+    --split-probe                 Send only the first part; rely on TCP retransmission
 
 SHAPE MODE:
     --burst-interval <duration>   Minimum interval between released SYN packets per IP
@@ -403,7 +407,7 @@ func main() {
 	_ = nf.SetOption(netlink.NoENOBUFS, true)
 
 	var rawSender *core.RawIPv4Sender
-	if cfg.Action == "split" {
+	if cfg.Action == "split" && !cfg.SplitProbe {
 		rawSender, err = core.NewRawIPv4Sender()
 		if err != nil {
 			fatalf("could not open raw IPv4 sender: %v", err)
@@ -486,10 +490,6 @@ func main() {
 				return 0
 			}
 
-			// Diagnostic mode: send only the first split segment through NFQUEUE.
-			// The second segment is intentionally not sent.
-			_ = second
-
 			mark := cfg.SplitMarkValue
 			if a.Mark != nil {
 				mark |= *a.Mark
@@ -500,7 +500,33 @@ func main() {
 				_ = nf.SetVerdict(id, nfqueue.NfAccept)
 				return 0
 			}
-			logVerbose(cfg.Verbose, "SPLIT-FIRST-ONLY src=%s:%d dst=%s:%d seq=%d payload=%d first=%d packet=%d split_mark=0x%x", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, cfg.SplitAt, id, cfg.SplitMarkValue)
+			if cfg.SplitProbe {
+				logVerbose(cfg.Verbose, "SPLIT-PROBE src=%s:%d dst=%s:%d seq=%d payload=%d first=%d packet=%d split_mark=0x%x", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, cfg.SplitAt, id, cfg.SplitMarkValue)
+				return 0
+			}
+
+			secondKey := splitSegmentKey{
+				SrcIP:      srcIPKey,
+				DstIP:      dstIPKey,
+				SrcPort:    info.SrcPort,
+				DstPort:    info.DstPort,
+				Seq:        info.Seq + uint32(cfg.SplitAt),
+				PayloadLen: info.PayloadLen - cfg.SplitAt,
+			}
+			splitSeen.Store(secondKey, time.Now())
+
+			go func() {
+				if cfg.SplitDelay > 0 {
+					time.Sleep(cfg.SplitDelay)
+				}
+				if err := rawSender.Send(second, mark); err != nil {
+					splitSeen.Delete(secondKey)
+					fmt.Fprintf(os.Stderr, "[nfqcooldown] split raw send failed src=%s:%d dst=%s:%d seq=%d len=%d: %v\n", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq+uint32(cfg.SplitAt), info.PayloadLen-cfg.SplitAt, err)
+					return
+				}
+				logVerbose(cfg.Verbose, "SPLIT-RAW-SENT src=%s:%d dst=%s:%d seq=%d payload=%d mark=0x%x", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq+uint32(cfg.SplitAt), info.PayloadLen-cfg.SplitAt, mark)
+			}()
+			logVerbose(cfg.Verbose, "SPLIT src=%s:%d dst=%s:%d seq=%d payload=%d parts=%d+%d packet=%d split_mark=0x%x", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, cfg.SplitAt, info.PayloadLen-cfg.SplitAt, id, cfg.SplitMarkValue)
 			return 0
 		}
 
@@ -835,8 +861,8 @@ func printStartupConfig(cfg Config, whitelistCount int) {
 	switch cfg.Action {
 	case "split":
 		fmt.Printf(
-			"[nfqcooldown] started queue=%d action=split packet=payload split_at=%d split_delay=%s split_mark=0x%x split_seen_ttl=%s skip_mark=%s verbose=%v\n",
-			cfg.QueueNum, cfg.SplitAt, cfg.SplitDelay, cfg.SplitMarkValue, cfg.SplitSeenTTL, formatSkipMark(cfg), cfg.Verbose,
+			"[nfqcooldown] started queue=%d action=split packet=payload split_at=%d split_delay=%s split_mark=0x%x split_seen_ttl=%s split_probe=%v skip_mark=%s verbose=%v\n",
+			cfg.QueueNum, cfg.SplitAt, cfg.SplitDelay, cfg.SplitMarkValue, cfg.SplitSeenTTL, cfg.SplitProbe, formatSkipMark(cfg), cfg.Verbose,
 		)
 
 	case "shape":
