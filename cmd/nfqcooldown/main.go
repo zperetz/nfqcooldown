@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -469,15 +470,18 @@ func cloneWithFakePayloadAndBadTCPChecksum(packet []byte, mode string) ([]byte, 
 	case "copy":
 		// Keep the original payload for comparison with the previous experiment.
 	case "tls-invalid-length":
-		// A TLS handshake record declaring 65535 bytes, followed by deterministic
-		// non-TLS filler. The packet length and TCP sequence range stay unchanged.
-		for i := payloadOffset; i < len(fake); i++ {
-			fake[i] = 0x41
-		}
-		if payloadLen >= 5 {
-			copy(fake[payloadOffset:payloadOffset+5], []byte{0x16, 0x03, 0x03, 0xff, 0xff})
-		} else {
+		// A TLS handshake record declaring 65535 bytes. Keep the five-byte
+		// header stable because it is the part intended to desynchronize the DPI,
+		// but randomize the remaining payload to avoid a fixed filler signature.
+		// The packet length and TCP sequence range stay unchanged.
+		if payloadLen < 5 {
 			return nil, 0, 0, fmt.Errorf("payload too short for fake TLS header: %d", payloadLen)
+		}
+		copy(fake[payloadOffset:payloadOffset+5], []byte{0x16, 0x03, 0x03, 0xff, 0xff})
+		if payloadLen > 5 {
+			if _, err := cryptorand.Read(fake[payloadOffset+5:]); err != nil {
+				return nil, 0, 0, fmt.Errorf("randomize fake TLS payload: %w", err)
+			}
 		}
 	default:
 		return nil, 0, 0, fmt.Errorf("unknown fake payload mode %q", mode)
