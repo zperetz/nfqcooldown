@@ -97,7 +97,7 @@ func parseConfig() Config {
 	fakePayload := flag.String("fake-payload", "tls-invalid-length", "fake payload: copy or tls-invalid-length")
 	fakeLength := flag.Int("fake-length", 0, "fake TCP payload length; 0 keeps the original payload length")
 	fakeDelayStr := flag.String("fake-delay", "5ms", "delay between the fake and the real packet or reverse split")
-	passWindowStr := flag.String("pass-window", "0", "pass the first TLS ServerHello normally, then split later ServerHello packets to the same client within this fixed window; 0 disables")
+	passWindowStr := flag.String("pass-window", "0", "pass the first TCP payload packet normally, then split later payload packets to the same client within this fixed window; 0 disables")
 
 	flag.Usage = printUsage
 
@@ -354,7 +354,7 @@ SPLIT MODE:
     --fake-payload <mode>         Fake payload: copy or tls-invalid-length
     --fake-length <n>             Fake TCP payload bytes; 0 keeps original length
     --fake-delay <duration>       Delay between fake and real data (default: 5ms)
-    --pass-window <duration>      Pass first ServerHello normally, split later ServerHello packets inside fixed window; 0 disables
+    --pass-window <duration>      Pass first payload normally, split later payload packets inside fixed window; 0 disables
 
 SHAPE MODE:
     --burst-interval <duration>   Minimum interval between released SYN packets per IP
@@ -412,18 +412,18 @@ type burstPacerState struct {
 	Pending     bool
 }
 
-type splitServerHelloWindowState struct {
+type splitPayloadWindowState struct {
 	mu       sync.Mutex
 	lastPass map[[4]byte]time.Time
 }
 
-func newSplitServerHelloWindowState() *splitServerHelloWindowState {
-	return &splitServerHelloWindowState{
+func newSplitPayloadWindowState() *splitPayloadWindowState {
+	return &splitPayloadWindowState{
 		lastPass: make(map[[4]byte]time.Time),
 	}
 }
 
-func (s *splitServerHelloWindowState) decide(clientIP [4]byte, now time.Time, window time.Duration) (split bool, sincePass time.Duration) {
+func (s *splitPayloadWindowState) decide(clientIP [4]byte, now time.Time, window time.Duration) (split bool, sincePass time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -439,7 +439,7 @@ func (s *splitServerHelloWindowState) decide(clientIP [4]byte, now time.Time, wi
 	return true, now.Sub(last)
 }
 
-func (s *splitServerHelloWindowState) cleanup(now time.Time, ttl time.Duration) int {
+func (s *splitPayloadWindowState) cleanup(now time.Time, ttl time.Duration) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -451,29 +451,6 @@ func (s *splitServerHelloWindowState) cleanup(now time.Time, ttl time.Duration) 
 		}
 	}
 	return removed
-}
-
-func isTLSServerHello(packet []byte) bool {
-	if len(packet) < 20 || packet[0]>>4 != 4 || packet[9] != 6 {
-		return false
-	}
-
-	ipHeaderLen := int(packet[0]&0x0f) * 4
-	if ipHeaderLen < 20 || len(packet) < ipHeaderLen+20 {
-		return false
-	}
-
-	tcpHeaderLen := int(packet[ipHeaderLen+12]>>4) * 4
-	payloadOffset := ipHeaderLen + tcpHeaderLen
-	if tcpHeaderLen < 20 || payloadOffset+6 > len(packet) {
-		return false
-	}
-
-	payload := packet[payloadOffset:]
-	return payload[0] == 0x16 && // TLS Handshake record
-		payload[1] == 0x03 && // TLS major version
-		payload[2] <= 0x04 && // SSLv3 through TLS 1.3 legacy record version
-		payload[5] == 0x02 // ServerHello handshake message
 }
 
 type splitSegmentKey struct {
@@ -662,13 +639,13 @@ func main() {
 	var burstPacerByIP sync.Map
 	var shapePendingFlows sync.Map
 	var splitSeen sync.Map
-	splitServerHelloWindow := newSplitServerHelloWindowState()
+	splitPayloadWindow := newSplitPayloadWindowState()
 
 	go cleanupLoop(ctx, state, cfg.CleanupEvery, cfg.CleanupAfter)
 	go shapeCleanupLoop(ctx, &burstPacerByIP, cfg.CleanupEvery, cfg.CleanupAfter)
 	go splitSeenCleanupLoop(ctx, &splitSeen, cfg.CleanupEvery, cfg.SplitSeenTTL)
 	if cfg.PassWindow > 0 {
-		go splitServerHelloWindowCleanupLoop(ctx, splitServerHelloWindow, cfg.CleanupEvery, cfg.PassWindow)
+		go splitPayloadWindowCleanupLoop(ctx, splitPayloadWindow, cfg.CleanupEvery, cfg.PassWindow)
 	}
 	go statsLoop(ctx, cfg, state, counters)
 
@@ -699,23 +676,6 @@ func main() {
 			copy(srcIPKey[:], info.SrcIP.To4())
 			copy(dstIPKey[:], info.DstIP.To4())
 
-			if cfg.PassWindow > 0 {
-				if !isTLSServerHello(*a.Payload) {
-					logVerbose(cfg.Verbose, "SPLIT-PASS-NOT-SERVERHELLO src=%s:%d dst=%s:%d seq=%d payload=%d packet=%d", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, id)
-					_ = nf.SetVerdict(id, nfqueue.NfAccept)
-					return 0
-				}
-
-				shouldSplit, sincePass := splitServerHelloWindow.decide(dstIPKey, time.Now(), cfg.PassWindow)
-				if !shouldSplit {
-					logVerbose(cfg.Verbose, "SPLIT-PASS-SERVERHELLO src=%s:%d dst=%s:%d seq=%d payload=%d packet=%d pass_window=%s since_pass=%s", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, id, cfg.PassWindow, sincePass)
-					_ = nf.SetVerdict(id, nfqueue.NfAccept)
-					return 0
-				}
-
-				logVerbose(cfg.Verbose, "SPLIT-ACTIVE-SERVERHELLO src=%s:%d dst=%s:%d seq=%d payload=%d packet=%d since_pass=%s pass_window=%s", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, id, sincePass, cfg.PassWindow)
-			}
-
 			splitKey := splitSegmentKey{
 				SrcIP:      srcIPKey,
 				DstIP:      dstIPKey,
@@ -724,11 +684,26 @@ func main() {
 				Seq:        info.Seq,
 				PayloadLen: info.PayloadLen,
 			}
-			if _, alreadySplit := splitSeen.LoadOrStore(splitKey, time.Now()); alreadySplit {
+			if _, alreadySplit := splitSeen.Load(splitKey); alreadySplit {
 				logVerbose(cfg.Verbose, "SPLIT-RETRANSMIT-PASS src=%s:%d dst=%s:%d seq=%d payload=%d packet=%d", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, id)
 				_ = nf.SetVerdict(id, nfqueue.NfAccept)
 				return 0
 			}
+
+			if cfg.PassWindow > 0 {
+				shouldSplit, sincePass := splitPayloadWindow.decide(dstIPKey, time.Now(), cfg.PassWindow)
+				if !shouldSplit {
+					// Remember the normally passed segment as well. Its TCP retransmission
+					// must remain unchanged instead of being split inside the active window.
+					splitSeen.Store(splitKey, time.Now())
+					logVerbose(cfg.Verbose, "SPLIT-PASS-WINDOW src=%s:%d dst=%s:%d seq=%d payload=%d packet=%d pass_window=%s since_pass=%s", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, id, cfg.PassWindow, sincePass)
+					_ = nf.SetVerdict(id, nfqueue.NfAccept)
+					return 0
+				}
+				logVerbose(cfg.Verbose, "SPLIT-ACTIVE-WINDOW src=%s:%d dst=%s:%d seq=%d payload=%d packet=%d since_pass=%s pass_window=%s", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, id, sincePass, cfg.PassWindow)
+			}
+
+			splitSeen.Store(splitKey, time.Now())
 
 			mark := cfg.SplitMarkValue
 			if a.Mark != nil {
@@ -1332,9 +1307,9 @@ func printStats(
 	}
 }
 
-func splitServerHelloWindowCleanupLoop(
+func splitPayloadWindowCleanupLoop(
 	ctx context.Context,
-	state *splitServerHelloWindowState,
+	state *splitPayloadWindowState,
 	every time.Duration,
 	passWindow time.Duration,
 ) {
@@ -1353,7 +1328,7 @@ func splitServerHelloWindowCleanupLoop(
 		case now := <-t.C:
 			removed := state.cleanup(now, ttl)
 			if removed > 0 {
-				fmt.Printf("[nfqcooldown] split ServerHello-window cleanup removed=%d ttl=%s\n", removed, ttl)
+				fmt.Printf("[nfqcooldown] split payload-window cleanup removed=%d ttl=%s\n", removed, ttl)
 			}
 		}
 	}
