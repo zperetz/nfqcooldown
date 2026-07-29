@@ -58,6 +58,7 @@ type Config struct {
 	SplitProbe        bool
 	SplitReverse      bool
 	FakeBadChecksum   bool
+	FakePayload       string
 	FakeDelay         time.Duration
 }
 
@@ -89,8 +90,9 @@ func parseConfig() Config {
 	splitSeenTTLStr := flag.String("split-seen-ttl", "1m", "remember split TCP segments for this duration and pass retransmissions unchanged")
 	splitProbe := flag.Bool("split-probe", false, "send only the first split segment and rely on TCP retransmission")
 	splitReverse := flag.Bool("split-reverse", false, "send the second split segment before the first")
-	fakeBadChecksum := flag.Bool("fake-bad-checksum", false, "send a copy with an invalid TCP checksum before the original payload packet")
-	fakeDelayStr := flag.String("fake-delay", "5ms", "delay between the bad-checksum fake and the original packet")
+	fakeBadChecksum := flag.Bool("fake-bad-checksum", false, "send an invalid-checksum fake before the real payload packet")
+	fakePayload := flag.String("fake-payload", "tls-invalid-length", "fake payload: copy or tls-invalid-length")
+	fakeDelayStr := flag.String("fake-delay", "5ms", "delay between the fake and the real packet or reverse split")
 
 	flag.Usage = printUsage
 
@@ -153,8 +155,11 @@ func parseConfig() Config {
 	if *splitProbe && *splitReverse {
 		fatalf("--split-probe and --split-reverse cannot be used together")
 	}
-	if *fakeBadChecksum && (*splitProbe || *splitReverse) {
-		fatalf("--fake-bad-checksum cannot be combined with --split-probe or --split-reverse")
+	if *fakeBadChecksum && *splitProbe {
+		fatalf("--fake-bad-checksum cannot be combined with --split-probe")
+	}
+	if *fakePayload != "copy" && *fakePayload != "tls-invalid-length" {
+		fatalf("bad fake-payload %q: use copy or tls-invalid-length", *fakePayload)
 	}
 	if fakeDelay < 0 {
 		fatalf("bad fake-delay %q: must be >= 0", *fakeDelayStr)
@@ -211,6 +216,7 @@ func parseConfig() Config {
 		SplitProbe:        *splitProbe,
 		SplitReverse:      *splitReverse,
 		FakeBadChecksum:   *fakeBadChecksum,
+		FakePayload:       *fakePayload,
 		FakeDelay:         fakeDelay,
 	}
 }
@@ -327,8 +333,9 @@ SPLIT MODE:
     --split-seen-ttl <duration>   Remember split segments and pass retransmits unchanged (default: 1m)
     --split-probe                 Send only the first part; rely on TCP retransmission
     --split-reverse               Send the second part before the first
-    --fake-bad-checksum           Send invalid-checksum fake, then the original packet
-    --fake-delay <duration>       Delay between fake and original (default: 5ms)
+    --fake-bad-checksum           Send an invalid-checksum fake before real data
+    --fake-payload <mode>         Fake payload: copy or tls-invalid-length
+    --fake-delay <duration>       Delay between fake and real data (default: 5ms)
 
 SHAPE MODE:
     --burst-interval <duration>   Minimum interval between released SYN packets per IP
@@ -395,7 +402,40 @@ type splitSegmentKey struct {
 	PayloadLen int
 }
 
-func cloneWithBadTCPChecksum(packet []byte) ([]byte, uint16, uint16, error) {
+func internetChecksum(data []byte) uint16 {
+	var sum uint32
+	for len(data) >= 2 {
+		sum += uint32(data[0])<<8 | uint32(data[1])
+		data = data[2:]
+	}
+	if len(data) == 1 {
+		sum += uint32(data[0]) << 8
+	}
+	for sum>>16 != 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
+
+func tcpChecksumIPv4(packet []byte, ipHeaderLen int) (uint16, error) {
+	if len(packet) < ipHeaderLen+20 {
+		return 0, fmt.Errorf("invalid IPv4/TCP header length")
+	}
+	tcpLen := len(packet) - ipHeaderLen
+	pseudoAndTCP := make([]byte, 12+tcpLen)
+	copy(pseudoAndTCP[0:4], packet[12:16])
+	copy(pseudoAndTCP[4:8], packet[16:20])
+	pseudoAndTCP[8] = 0
+	pseudoAndTCP[9] = 6
+	pseudoAndTCP[10] = byte(tcpLen >> 8)
+	pseudoAndTCP[11] = byte(tcpLen)
+	copy(pseudoAndTCP[12:], packet[ipHeaderLen:])
+	pseudoAndTCP[12+16] = 0
+	pseudoAndTCP[12+17] = 0
+	return internetChecksum(pseudoAndTCP), nil
+}
+
+func cloneWithFakePayloadAndBadTCPChecksum(packet []byte, mode string) ([]byte, uint16, uint16, error) {
 	if len(packet) < 20 {
 		return nil, 0, 0, fmt.Errorf("IPv4 packet too short: %d", len(packet))
 	}
@@ -411,14 +451,46 @@ func cloneWithBadTCPChecksum(packet []byte) ([]byte, uint16, uint16, error) {
 		return nil, 0, 0, fmt.Errorf("not TCP")
 	}
 
-	checksumOffset := ipHeaderLen + 16
-	original := uint16(packet[checksumOffset])<<8 | uint16(packet[checksumOffset+1])
-	corrupted := original ^ 0xffff
-	if corrupted == 0 {
-		corrupted = 1
+	tcpHeaderLen := int(packet[ipHeaderLen+12]>>4) * 4
+	payloadOffset := ipHeaderLen + tcpHeaderLen
+	if tcpHeaderLen < 20 || payloadOffset > len(packet) {
+		return nil, 0, 0, fmt.Errorf("invalid TCP header length")
+	}
+	payloadLen := len(packet) - payloadOffset
+	if payloadLen == 0 {
+		return nil, 0, 0, fmt.Errorf("empty TCP payload")
 	}
 
+	checksumOffset := ipHeaderLen + 16
+	original := uint16(packet[checksumOffset])<<8 | uint16(packet[checksumOffset+1])
 	fake := append([]byte(nil), packet...)
+
+	switch mode {
+	case "copy":
+		// Keep the original payload for comparison with the previous experiment.
+	case "tls-invalid-length":
+		// A TLS handshake record declaring 65535 bytes, followed by deterministic
+		// non-TLS filler. The packet length and TCP sequence range stay unchanged.
+		for i := payloadOffset; i < len(fake); i++ {
+			fake[i] = 0x41
+		}
+		if payloadLen >= 5 {
+			copy(fake[payloadOffset:payloadOffset+5], []byte{0x16, 0x03, 0x03, 0xff, 0xff})
+		} else {
+			return nil, 0, 0, fmt.Errorf("payload too short for fake TLS header: %d", payloadLen)
+		}
+	default:
+		return nil, 0, 0, fmt.Errorf("unknown fake payload mode %q", mode)
+	}
+
+	validFakeChecksum, err := tcpChecksumIPv4(fake, ipHeaderLen)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	corrupted := validFakeChecksum ^ 0xffff
+	if corrupted == validFakeChecksum {
+		corrupted ^= 1
+	}
 	fake[checksumOffset] = byte(corrupted >> 8)
 	fake[checksumOffset+1] = byte(corrupted)
 	return fake, original, corrupted, nil
@@ -539,7 +611,7 @@ func main() {
 			}
 
 			if cfg.FakeBadChecksum {
-				fake, originalChecksum, fakeChecksum, err := cloneWithBadTCPChecksum(*a.Payload)
+				fake, originalChecksum, fakeChecksum, err := cloneWithFakePayloadAndBadTCPChecksum(*a.Payload, cfg.FakePayload)
 				if err != nil {
 					splitSeen.Delete(splitKey)
 					logVerbose(cfg.Verbose, "FAKE-BAD-CHECKSUM-SKIP src=%s:%d dst=%s:%d seq=%d payload=%d packet=%d reason=%q", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, id, err)
@@ -553,19 +625,24 @@ func main() {
 					_ = nf.SetVerdict(id, nfqueue.NfAccept)
 					return 0
 				}
-				logVerbose(cfg.Verbose, "FAKE-BAD-CHECKSUM-SENT src=%s:%d dst=%s:%d seq=%d payload=%d tcp_checksum=0x%04x->0x%04x mark=0x%x", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, originalChecksum, fakeChecksum, mark)
+				logVerbose(cfg.Verbose, "FAKE-BAD-CHECKSUM-SENT src=%s:%d dst=%s:%d seq=%d payload=%d fake_payload=%s tcp_checksum=0x%04x->0x%04x mark=0x%x", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, cfg.FakePayload, originalChecksum, fakeChecksum, mark)
 
 				if cfg.FakeDelay > 0 {
 					time.Sleep(cfg.FakeDelay)
 				}
-				if err := nf.SetVerdictModPacketWithConnMark(id, nfqueue.NfAccept, int(mark), *a.Payload); err != nil {
-					splitSeen.Delete(splitKey)
-					fmt.Fprintf(os.Stderr, "[nfqcooldown] fake original verdict failed packet=%d: %v\n", id, err)
-					_ = nf.SetVerdict(id, nfqueue.NfAccept)
+
+				if !cfg.SplitReverse {
+					if err := nf.SetVerdictModPacketWithConnMark(id, nfqueue.NfAccept, int(mark), *a.Payload); err != nil {
+						splitSeen.Delete(splitKey)
+						fmt.Fprintf(os.Stderr, "[nfqcooldown] fake original verdict failed packet=%d: %v\n", id, err)
+						_ = nf.SetVerdict(id, nfqueue.NfAccept)
+						return 0
+					}
+					logVerbose(cfg.Verbose, "FAKE-BAD-CHECKSUM-ORIGINAL src=%s:%d dst=%s:%d seq=%d payload=%d fake_payload=%s packet=%d delay=%s mark=0x%x", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, cfg.FakePayload, id, cfg.FakeDelay, mark)
 					return 0
 				}
-				logVerbose(cfg.Verbose, "FAKE-BAD-CHECKSUM-ORIGINAL src=%s:%d dst=%s:%d seq=%d payload=%d packet=%d delay=%s mark=0x%x", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, id, cfg.FakeDelay, mark)
-				return 0
+
+				logVerbose(cfg.Verbose, "FAKE-BAD-CHECKSUM-BEFORE-REVERSE src=%s:%d dst=%s:%d seq=%d payload=%d fake_payload=%s delay=%s", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, cfg.FakePayload, cfg.FakeDelay)
 			}
 
 			first, second, err := core.SplitIPv4TCPPacket(*a.Payload, info, cfg.SplitAt)
@@ -967,8 +1044,8 @@ func printStartupConfig(cfg Config, whitelistCount int) {
 	switch cfg.Action {
 	case "split":
 		fmt.Printf(
-			"[nfqcooldown] started queue=%d action=split packet=payload split_at=%d split_delay=%s split_mark=0x%x split_seen_ttl=%s split_probe=%v split_reverse=%v fake_bad_checksum=%v fake_delay=%s skip_mark=%s verbose=%v\n",
-			cfg.QueueNum, cfg.SplitAt, cfg.SplitDelay, cfg.SplitMarkValue, cfg.SplitSeenTTL, cfg.SplitProbe, cfg.SplitReverse, cfg.FakeBadChecksum, cfg.FakeDelay, formatSkipMark(cfg), cfg.Verbose,
+			"[nfqcooldown] started queue=%d action=split packet=payload split_at=%d split_delay=%s split_mark=0x%x split_seen_ttl=%s split_probe=%v split_reverse=%v fake_bad_checksum=%v fake_payload=%s fake_delay=%s skip_mark=%s verbose=%v\n",
+			cfg.QueueNum, cfg.SplitAt, cfg.SplitDelay, cfg.SplitMarkValue, cfg.SplitSeenTTL, cfg.SplitProbe, cfg.SplitReverse, cfg.FakeBadChecksum, cfg.FakePayload, cfg.FakeDelay, formatSkipMark(cfg), cfg.Verbose,
 		)
 
 	case "shape":
