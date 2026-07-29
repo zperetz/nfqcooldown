@@ -486,15 +486,9 @@ func main() {
 				return 0
 			}
 
-			secondKey := splitSegmentKey{
-				SrcIP:      srcIPKey,
-				DstIP:      dstIPKey,
-				SrcPort:    info.SrcPort,
-				DstPort:    info.DstPort,
-				Seq:        info.Seq + uint32(cfg.SplitAt),
-				PayloadLen: info.PayloadLen - cfg.SplitAt,
-			}
-			splitSeen.Store(secondKey, time.Now())
+			// Diagnostic mode: send only the first split segment through NFQUEUE.
+			// The second segment is intentionally not sent.
+			_ = second
 
 			mark := cfg.SplitMarkValue
 			if a.Mark != nil {
@@ -502,23 +496,11 @@ func main() {
 			}
 			if err := nf.SetVerdictModPacketWithConnMark(id, nfqueue.NfAccept, int(mark), first); err != nil {
 				splitSeen.Delete(splitKey)
-				splitSeen.Delete(secondKey)
 				fmt.Fprintf(os.Stderr, "[nfqcooldown] split verdict failed packet=%d: %v\n", id, err)
 				_ = nf.SetVerdict(id, nfqueue.NfAccept)
 				return 0
 			}
-			go func() {
-				if cfg.SplitDelay > 0 {
-					time.Sleep(cfg.SplitDelay)
-				}
-				if err := rawSender.Send(second, mark); err != nil {
-					splitSeen.Delete(secondKey)
-					fmt.Fprintf(os.Stderr, "[nfqcooldown] split raw send failed src=%s:%d dst=%s:%d seq=%d len=%d: %v\n", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq+uint32(cfg.SplitAt), info.PayloadLen-cfg.SplitAt, err)
-					return
-				}
-				logVerbose(cfg.Verbose, "SPLIT-RAW-SENT src=%s:%d dst=%s:%d seq=%d payload=%d mark=0x%x", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq+uint32(cfg.SplitAt), info.PayloadLen-cfg.SplitAt, mark)
-			}()
-			logVerbose(cfg.Verbose, "SPLIT src=%s:%d dst=%s:%d seq=%d payload=%d parts=%d+%d packet=%d split_mark=0x%x", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, cfg.SplitAt, info.PayloadLen-cfg.SplitAt, id, cfg.SplitMarkValue)
+			logVerbose(cfg.Verbose, "SPLIT-FIRST-ONLY src=%s:%d dst=%s:%d seq=%d payload=%d first=%d packet=%d split_mark=0x%x", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort, info.Seq, info.PayloadLen, cfg.SplitAt, id, cfg.SplitMarkValue)
 			return 0
 		}
 
