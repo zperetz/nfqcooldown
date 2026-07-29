@@ -1316,19 +1316,14 @@ func splitPayloadWindowCleanupLoop(
 	t := time.NewTicker(every)
 	defer t.Stop()
 
-	ttl := passWindow * 2
-	if ttl < every {
-		ttl = every
-	}
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case now := <-t.C:
-			removed := state.cleanup(now, ttl)
+			removed := state.cleanup(now, passWindow)
 			if removed > 0 {
-				fmt.Printf("[nfqcooldown] split payload-window cleanup removed=%d ttl=%s\n", removed, ttl)
+				fmt.Printf("[nfqcooldown] split payload-window cleanup removed=%d ttl=%s\n", removed, passWindow)
 			}
 		}
 	}
